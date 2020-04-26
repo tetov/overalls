@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=42", "wheel", "setuptools_scm[toml]>=3.4"]
+
+[tool.setuptools_scm]
+write_to = "src/_version.py"
+
+[tool.isort]
+force_single_line = true
+line_length = 120
+known_third_party = "compas,Rhino"
+default_section = "THIRDPARTY"
+forced_separate = "test_compas_pyurscript"
+skip = "_version.py"
+
+[tool.black]
+include = '\.pyi?$'
+target-version = ['py37', 'py38']
