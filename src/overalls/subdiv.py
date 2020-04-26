@@ -1,79 +1,78 @@
 from itertools import cycle
 
-import Rhino.Geometry as rg
+from compas.datastructures import Mesh
+from compas.geometry import Point
 
 
-def subdiv(subd, fkeys, n_iters, scheme=[0], **kwargs):
-    schemes = [face_subdiv_retriangulate, face_subdiv_frame]
+class OverallMesh(Mesh):
+    def __init__(self):
+        super(OverallMesh, self).__init__()
 
-    subd = subd.copy()
+    def subdiv_faces(self, fkeys, n_iters, scheme=[0], **kwargs):
+        schemes = [self.face_subdiv_retriangulate, self.face_subdiv_frame]
 
-    repeating_n_iters = cycle(n_iters)
-    repeating_schemes = cycle(scheme)
+        repeating_n_iters = cycle(n_iters)
+        repeating_schemes = cycle(scheme)
 
-    new_fkeys = []
-    for fkey in fkeys:
-        n_iters = next(repeating_n_iters)
-        subdiv_func = schemes[next(repeating_schemes)]
+        new_fkeys = []
+        for fkey in fkeys:
+            n_iters = next(repeating_n_iters)
+            subdiv_func = schemes[next(repeating_schemes)]
 
-        i = 0
-        next_to_subd = [fkey]
-        while i < n_iters:
-            to_subd = next_to_subd
-            next_to_subd = []
+            i = 0
+            next_to_subd = [fkey]
+            while i < n_iters:
+                to_subd = next_to_subd
+                next_to_subd = []
 
-            for fkey_prim in to_subd:
-                # subd = subd.copy()
+                for fkey_prim in to_subd:
+                    returned_fkeys = subdiv_func(fkey_prim, **kwargs)
+                    next_to_subd += returned_fkeys
+                    new_fkeys += returned_fkeys
+                i += 1
 
-                subd, returned_fkeys = subdiv_func(subd, fkey_prim, **kwargs)
-                next_to_subd += returned_fkeys
-                new_fkeys += returned_fkeys
-            i += 1
+        return new_fkeys
 
-    return subd, new_fkeys
+    def face_subdiv_retriangulate(self, fkey, **kwargs):
+        x, y, z = self.face_center(fkey)
+        fkeys = []
+        w = self.add_vertex(x=x, y=y, z=z)
+        for u, v in self.face_halfedges(fkey):
+            fkeys.append(self.add_face([u, v, w]))
+        del self.face[fkey]
+        # fix bug raised in https://github.com/compas-dev/compas/issues/522
+        sets_verts = [set(self.face_vertices(fkey_)) for fkey_ in fkeys]
+        for i in range(len(sets_verts)):
+            if len(sets_verts[i]) == 2:
+                del self.face[fkeys.pop(i)]
+        return fkeys
 
+    def face_subdiv_frame(self, fkey, rel_dist=0.5):
+        x, y, z = self.face_center(fkey)
+        face_center_pt = Point(x, y, z)
 
-def face_subdiv_retriangulate(subd, fkey, **kwargs):
-    x, y, z = subd.face_center(fkey)
-    fkeys = []
-    w = subd.add_vertex(x=x, y=y, z=z)
-    for u, v in subd.face_halfedges(fkey):
-        fkeys.append(subd.add_face([u, v, w]))
-    del subd.face[fkey]
-    # fix bug raised in https://github.com/compas-dev/compas/issues/522
-    sets_verts = [set(subd.face_vertices(fkey_)) for fkey_ in fkeys]
-    for i in range(len(sets_verts)):
-        if len(sets_verts[i]) == 2:
-            del subd.face[fkeys.pop(i)]
-    return subd, fkeys
+        new_vkeys = []
+        for x, y, z in self.face_coordinates(fkey):
+            pt = Point(x, y, z)
 
+            v = face_center_pt - pt
+            pt += v * rel_dist
+            new_vkeys.append(self.add_vertex(x=pt.x, y=pt.x, z=pt.x))
 
-def face_subdiv_frame(subd, fkey, rel_dist=0.5):
-    x, y, z = subd.face_center(fkey)
-    face_center_pt = rg.Point3d(x, y, z)
+        face_verts = self.face_vertices(fkey)
+        new_fkeys = []
+        for j in range(len(face_verts)):
+            vkeys = []
+            vkeys.append(face_verts[j])
+            vkeys.append(face_verts[(j + 1) % len(face_verts)])
+            vkeys.append(new_vkeys[(j + 1) % len(new_vkeys)])
+            vkeys.append(new_vkeys[j])
 
-    new_vkeys = []
-    for x, y, z in subd.face_coordinates(fkey):
-        pt = rg.Point3d(x, y, z)
+            new_fkeys.append(self.add_face(vkeys))
 
-        v = rg.Vector3d(face_center_pt) - rg.Vector3d(pt)
-        pt += v * rel_dist
-        new_vkeys.append(subd.add_vertex(x=pt.X, y=pt.Y, z=pt.Z))
+        # add new center face
+        new_fkeys.append(self.add_face(new_vkeys))
 
-    face_verts = subd.face_vertices(fkey)
-    new_fkeys = []
-    for j in range(len(face_verts)):
-        vkeys = []
-        vkeys.append(face_verts[j])
-        vkeys.append(face_verts[(j + 1) % len(face_verts)])
-        vkeys.append(new_vkeys[(j + 1) % len(new_vkeys)])
-        vkeys.append(new_vkeys[j])
+        self.delete_face(fkey)
 
-        new_fkeys.append(subd.add_face(vkeys))
-
-    # add new center face
-    new_fkeys.append(subd.add_face(new_vkeys))
-
-    subd.delete_face(fkey)
-
-    return subd, new_fkeys
+        return new_fkeys
