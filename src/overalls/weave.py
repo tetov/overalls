@@ -42,15 +42,15 @@ def find_closest_faces(
     return partners
 
 
-def find_closest_faces_neighbours(meshes, *args, **kwargs):
+def find_closest_faces_neighbors(meshes, *args, **kwargs):
     original_partners = find_closest_faces(meshes, *args, **kwargs)
 
     partners = []
     for partner_a, partners_b in original_partners:
-        nbours = set()
+        nbors = set()
         for partner in partners_b:
-            nbours.update(meshes[1].face_neighbors(partner))
-        partners.append((partner_a, list(nbours)))
+            nbors.update(meshes[1].face_neighbors(partner))
+        partners.append((partner_a, list(nbors)))
     return partners
 
 
@@ -90,7 +90,12 @@ def find_closest_face_same_mesh(
 
 
 # CREATE CONNECTING LINES
-def line_center_center(meshes, fkeys, network, **kwargs):
+def line_center_center(meshes, fkeys, network, max_degrees=None, **kwargs):
+    def _edges_verts_center(mesh, network, fkey, nkey, mesh_id):
+        for vkey in mesh.face_vertices(fkey):
+            nkey_2 = next(network.nodes_where({"mesh": mesh_id, "vkey": vkey}))
+            network.add_edge(nkey, nkey_2, mesh=mesh_id, fkey=fkey)
+
     if not isinstance(meshes, Sequence):
         meshes = [meshes] * 2
 
@@ -104,38 +109,43 @@ def line_center_center(meshes, fkeys, network, **kwargs):
 
     fkey_a, fkeys_b = fkeys
 
-    def _edges_verts_center(mesh, network, fkey, nkey, mesh_id):
-        for vkey in mesh.face_vertices(fkey):
-            nkey_2 = next(network.nodes_where({"mesh": mesh_id, "vkey": vkey}))
-            network.add_edge(nkey, nkey_2, mesh=mesh_id, fkey=fkey)
-
     # connect center to center
     x, y, z = mesh_a.face_center(fkey_a)
-    center_node_a = network.add_node(x=x, y=y, z=z, mesh=0, fkey=fkey_a)
+    center_node_a = network.add_node(x=x, y=y, z=z, mesh=mesh_a_id, fkey=fkey_a)
 
-    # subdivide face so there's a node to connect to at center of faces
-    _edges_verts_center(mesh_a, network, fkey_a, center_node_a, mesh_a_id)
-
-    center_nodes_b = []
+    nkeys_b = []
     for fkey in fkeys_b:
         try:
-            nkey = next(network.nodes_where({"mesh": 1, "fkey": fkey}))
+            nkey = next(network.nodes_where({"mesh": mesh_b_id, "fkey": fkey}))
+            if network.degrees(nkey) > max_degrees:
+                continue
         except StopIteration:
             x, y, z = mesh_b.face_center(fkey)
-            nkey = network.add_node(x=x, y=y, z=z, mesh=1, fkey=fkey)
-        _edges_verts_center(mesh_b, network, fkey, nkey, 1)
-        center_nodes_b.append(nkey)
+            nkey = network.add_node(x=x, y=y, z=z, mesh=mesh_b_id, fkey=fkey)
+        nkeys_b.append(nkey)
 
-    for nkey in center_nodes_b:
+    if len(nkeys_b) == 0:  # skip rest if no matches where found
+        return
+
+    # subdivide a face so there's a node to connect to at center of face
+    _edges_verts_center(mesh_a, network, fkey_a, center_node_a, mesh_a_id)
+
+    for nkey in nkeys_b:
+        # subdivide face so there's a node to connect to at center of faces
+        _edges_verts_center(mesh_b, network, fkey, nkey, mesh_b_id)
+
+        # connect a to b
         network.add_edge(center_node_a, nkey)
 
 
-def line_vert_vert(meshes, fkeys, network, rel_vkeys=[None, None], **kwargs):
+def line_vert_vert(
+    meshes, fkeys, network, rel_vkeys=[None, None], max_degrees=None, **kwargs
+):
     """Create a line between a vertex on one mesh to a vertex on another.
 
     Parameters
     ----------
-    meshes : :obj:`list` of :class:`compas.datastructures.Mesh` or :class:`compas.datastructure.Mesh`
+    meshes : :obj:`list` of :class:`compas.datastructures.Mesh`
         Mesh or meshes to connect.
     fkeys_a : list of int or int
         Face keys for faces on first mesh to connect. If length between fkeys_a
@@ -215,7 +225,10 @@ def line_vert_vert(meshes, fkeys, network, rel_vkeys=[None, None], **kwargs):
         u = nkeys_a[key_idx_a]
         v = nkeys_b[key_idx_b]
 
-        # u = next(network.nodes_where({"mesh": 0, "vkey": selected_vkey_a}))
-        # v = next(network.nodes_where({"mesh": 1, "vkey": selected_vkey_b}))
+        if max_degrees:
+            u_ok = network.degrees(u) <= max_degrees
+            v_ok = network.degrees(v) <= max_degrees
+            if not u_ok or not v_ok:
+                continue
 
         network.add_edge(u, v)
