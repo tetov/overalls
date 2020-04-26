@@ -83,8 +83,6 @@ def find_closest_face_same_mesh(
 
         dists.sort(key=lambda x: x[1], reverse=prefer_long)
         keys, _ = zip(*dists)
-        print(n_face_connections)
-        print(keys[:n_face_connections])
         partners.append((fkey, keys[:n_face_connections]))
     return partners
 
@@ -117,7 +115,7 @@ def line_center_center(meshes, fkeys, network, max_degrees=None, **kwargs):
     for fkey in fkeys_b:
         try:
             nkey = next(network.nodes_where({"mesh": mesh_b_id, "fkey": fkey}))
-            if network.degrees(nkey) > max_degrees:
+            if max_degrees is not None and network.degree(nkey) > max_degrees:
                 continue
         except StopIteration:
             x, y, z = mesh_b.face_center(fkey)
@@ -226,8 +224,8 @@ def line_vert_vert(
         v = nkeys_b[key_idx_b]
 
         if max_degrees:
-            u_ok = network.degrees(u) <= max_degrees
-            v_ok = network.degrees(v) <= max_degrees
+            u_ok = network.degree(u) <= max_degrees
+            v_ok = network.degree(v) <= max_degrees
             if not u_ok or not v_ok:
                 continue
 
