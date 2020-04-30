@@ -34,17 +34,7 @@ class OverallMesh(Mesh):
         return new_fkeys
 
     def face_subdiv_retriangulate(self, fkey, **kwargs):
-        x, y, z = self.face_center(fkey)
-        fkeys = []
-        w = self.add_vertex(x=x, y=y, z=z)
-        for u, v in self.face_halfedges(fkey):
-            fkeys.append(self.add_face([u, v, w]))
-        del self.face[fkey]
-        # fix bug raised in https://github.com/compas-dev/compas/issues/522
-        sets_verts = [set(self.face_vertices(fkey_)) for fkey_ in fkeys]
-        for i in range(len(sets_verts)):
-            if len(sets_verts[i]) == 2:
-                del self.face[fkeys.pop(i)]
+        _, fkeys = self.insert_vertex(fkey, return_fkeys=True)
         return fkeys
 
     def face_subdiv_frame(self, fkey, rel_dist=0.5):
@@ -57,7 +47,7 @@ class OverallMesh(Mesh):
 
             v = face_center_pt - pt
             pt += v * rel_dist
-            new_vkeys.append(self.add_vertex(x=pt.x, y=pt.x, z=pt.x))
+            new_vkeys.append(self.add_vertex(x=pt.x, y=pt.y, z=pt.z))
 
         face_verts = self.face_vertices(fkey)
         new_fkeys = []

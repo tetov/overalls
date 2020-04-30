@@ -22,7 +22,7 @@ def _read(*names, **kwargs):
 long_description = _read("README.md")
 
 requirements = [
-    "compas >= 0.15.5",
+    "compas >= 0.15.6",
 ]
 
 extras_require = {

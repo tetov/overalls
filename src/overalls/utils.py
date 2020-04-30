@@ -56,3 +56,7 @@ def is_in_domain(value, domain):
     max_ok = value < max or max is None
 
     return min_ok and max_ok
+
+
+def flatten(list_):
+    return [item for sublist in list_ for item in sublist]
