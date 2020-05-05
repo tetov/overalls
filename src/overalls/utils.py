@@ -60,3 +60,29 @@ def is_in_domain(value, domain):
 
 def flatten(list_):
     return [item for sublist in list_ for item in sublist]
+
+
+def is_str(obj):
+    try:
+        basestring
+    except NameError:
+        basestring = (str, bytes)
+    return isinstance(obj, basestring)
+
+
+def to_iter(obj):
+    if not is_str(obj):
+        try:
+            return iter(obj)
+        except TypeError:
+            pass
+    return iter([obj])
+
+
+def to_list(obj):
+    if not is_str(obj):
+        try:
+            return list(obj)
+        except TypeError:
+            pass
+    return [obj]
