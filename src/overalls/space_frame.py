@@ -98,17 +98,18 @@ class SpaceFrame(Mesh):
                     new_fkeys += returned_fkeys
                 i += 1
 
-        return new_fkeys
+        return [fkey for fkey in new_fkeys if self.has_face(fkey)]
 
     def face_subdiv_retriangulate(self, fkey, move_z=0.0, rel_pos=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
         if rel_pos:
-            if len(rel_pos) != len(list(self.face_vertices(fkey))):
+            face_verts = list(self.face_vertices(fkey))
+            if len(rel_pos) != len(face_verts):
                 raise Exception(
                     "Length of rel_pos not same as amount of face vertices."
                 )
-            for factor, vkey in zip(rel_pos, self.face_vertices(fkey)):
+            for factor, vkey in zip(rel_pos, face_verts):
                 v_xyz = Point(*self.vertex_coordinates(vkey))
                 v = (xyz - v_xyz) * 2
                 xyz += v * factor
@@ -119,18 +120,18 @@ class SpaceFrame(Mesh):
 
         vkey, fkeys = self.insert_vertex(fkey, xyz=list(xyz), return_fkeys=True)
 
-        ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]
+        ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]  # noqa: F841
 
         data = kwattr
         data.update({"parent_fkey": fkey})
 
-        self.components_attributes(fkeys, [vkey], ekeys, data)
+        # self.components_attributes(fkeys, [vkey], ekeys, data)
 
         return vkey, fkeys
 
     def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **kwattr):
         if rel_dist == 1:
-            return self.face_subdiv_retriangulate(fkey, move_z=move_z, **kwattr)
+            return self.face_subdiv_retriangulate(fkey, move_z=move_z ** kwattr)
         if rel_dist == 0:
             raise Exception("rel_dist can't be 0")
 
