@@ -1,12 +1,30 @@
+from itertools import chain
 from itertools import cycle
 
-import ghpythonlib.components as ghcomp
 import Rhino.Geometry as rg
 from compas.datastructures import Mesh
+from compas.datastructures import Network
 from compas.geometry import Point
 from compas.geometry import Vector
 from overalls.utils import is_in_domain
 from overalls.utils import to_list
+
+
+class ExtraEdge(object):
+    def __init__(self, u, v, **kwattr):
+        self.keys = (u, v)
+        self.attr = kwattr
+
+    @property
+    def u(self):
+        return self.keys[0]
+
+    @property
+    def v(self):
+        return self.keys[1]
+
+    def __eq__(self, other):
+        return set(self.keys) == set(other.keys)
 
 
 class SpaceFrame(Mesh):
@@ -20,22 +38,42 @@ class SpaceFrame(Mesh):
         self.update_default_face_attributes(parent_fkey=None, created_from=None)
         self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
         self.update_default_edge_attributes(parent_fkey=None, created_from=None)
+        self._extra_edges = []
 
-    def is_valid(self):
-        """This is sort of a test to see if mesh is weaved."""
-        for u, v in self.edges():
-            if self.edge_faces(u, v) > 2:
-                return False
-        return True
+    def extra_edges(self):
+        for edge in self._extra_edges:
+            yield (edge.u, edge.v)
 
-    def components_attributes(self, fkeys, vkeys, ekeys, attrs):
-        for key, value in attrs.items():
-            for vkey in vkeys:
-                self.vertex_attribute(vkey, key, value)
-            for u, v in ekeys:
-                self.edge_attribute((u, v), key, value)
-            for fkey in fkeys:
-                self.face_attribute(fkey, key, value)
+    def edges(self):
+        return chain(super(SpaceFrame, self).edges(), self.extra_edges())
+
+    def add_edge(self, u, v, **kwattr):
+        edge = ExtraEdge(u, v, **kwattr)
+        self._extra_edges.append(edge)
+
+    def edge_attributes(self, ekey, keys, values):
+        u, v = ekey
+        for edge in self.extra_edges():
+            tmp_obj = ExtraEdge(u, v)
+
+            if tmp_obj == edge:
+                new_attrs = {key: value for (key, value) in zip(keys, values)}
+                data = edge.attr
+                data.update(new_attrs)
+                edge.attr = data
+                break
+        super(SpaceFrame, self).edge_attributes((u, v), keys, values)
+
+    def edge_attribute(self, ekey, key, value):
+        self.edge_attributes(ekey, to_list(key), to_list(value))
+
+    def components_attributes(self, fkeys, vkeys, ekeys, attr):
+        for vkey in vkeys:
+            self.vertex_attributes(vkey, attr.keys(), attr.values())
+        for u, v in ekeys:
+            self.edge_attributes((u, v), attr.keys(), attr.values())
+        for fkey in fkeys:
+            self.face_attributes(fkey, attr.keys(), attr.values())
 
     def subdiv_faces(self, fkeys, n_iters, scheme=[0], **kwargs):
         schemes = [self.face_subdiv_retriangulate, self.face_subdiv_frame]
@@ -62,7 +100,7 @@ class SpaceFrame(Mesh):
 
         return new_fkeys
 
-    def face_subdiv_retriangulate(self, fkey, move_z=0.0, rel_pos=None, **attrs):
+    def face_subdiv_retriangulate(self, fkey, move_z=0.0, rel_pos=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
         if rel_pos:
@@ -83,15 +121,16 @@ class SpaceFrame(Mesh):
 
         ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]
 
-        attrs.update({"parent_fkey": fkey})
+        data = kwattr
+        data.update({"parent_fkey": fkey})
 
-        self.components_attributes(fkeys, [vkey], ekeys, attrs)
+        self.components_attributes(fkeys, [vkey], ekeys, data)
 
         return vkey, fkeys
 
-    def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **attrs):
+    def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **kwattr):
         if rel_dist == 1:
-            return self.face_subdiv_retriangulate(fkey, move_z=move_z, **attrs)
+            return self.face_subdiv_retriangulate(fkey, move_z=move_z, **kwattr)
         if rel_dist == 0:
             raise Exception("rel_dist can't be 0")
 
@@ -124,7 +163,12 @@ class SpaceFrame(Mesh):
         return new_vkeys, new_fkeys
 
     def find_closest_faces(
-        self, fkeys_origin, fkeys_search, n_face_connections=2, dist_domain=(None, None)
+        self,
+        fkeys_origin,
+        fkeys_search,
+        n_face_connections=2,
+        dist_domain=(None, None),
+        prefer_long=False,
     ):
         pt_cloud_dict = {}
         pt_cloud_list = []
@@ -136,58 +180,13 @@ class SpaceFrame(Mesh):
             pt_cloud_list.append(pt)
 
         partners = []
+
         for fkey in fkeys_origin:
-            partner_pts = []
-
-            x, y, z = self.face_center(fkey)
-            pt = rg.Point3d(x, y, z)
-
-            closest_pts, _, dist = ghcomp.ClosestPoints(
-                pt, pt_cloud_list, n_face_connections
-            )
-
-            if n_face_connections < 2:
-                closest_pts = [closest_pts]
-
-            for cp in closest_pts:
-                if is_in_domain(pt.DistanceTo(cp), dist_domain):
-                    partner_pts.append(pt_cloud_dict[cp])
-
-            if len(partner_pts) > 0:
-                partners.append((fkey, partner_pts))
-        return partners
-
-    def find_closest_faces_neighbors(self, fkeys_origin, fkeys_search, *args, **kwargs):
-        original_partners = self.find_closest_faces(
-            fkeys_origin, fkeys_search, *args, **kwargs
-        )
-
-        partners = []
-        for partner_a, partners_b in original_partners:
-            nbors = set()
-            for partner in partners_b:
-                nbors.update(self.face_neighbors(partner))
-            partners.append((partner_a, list(nbors)))
-        return partners
-
-    def find_closest_face_same_mesh(
-        self, fkeys, n_face_connections=2, dist_domain=(None, None), prefer_long=False
-    ):
-        fkeys = list(fkeys)
-        pt_cloud_dict = {}
-        for fkey in fkeys:
-            x, y, z = self.face_center(fkey)
-            pt = rg.Point3d(x, y, z)
-            pt_cloud_dict[pt] = fkey
-
-        partners = []
-
-        for fkey in fkeys:
             dists = []
             x, y, z = self.face_center(fkey)
             pt1 = rg.Point3d(x, y, z)
-            for pt2, key in pt_cloud_dict.iteritems():
 
+            for pt2, key in pt_cloud_dict.iteritems():
                 if key == fkey or key in self.face_neighbors(fkey):
                     continue
                 dist = pt1.DistanceTo(pt2)
@@ -202,7 +201,19 @@ class SpaceFrame(Mesh):
             partners.append((fkey, keys[:n_face_connections]))
         return partners
 
-    # CREATE CONNECTING LINES
+    def find_closest_face_nhood(self, fkeys_origin, fkeys_search, *args, **kwargs):
+        original_partners = self.find_closest_faces(
+            fkeys_origin, fkeys_search, *args, **kwargs
+        )
+
+        partners = []
+        for partner_a, partners_b in original_partners:
+            nbors = set()
+            for partner in partners_b:
+                nbors.update(self.face_neighbors(partner))
+            partners.append((partner_a, list(nbors)))
+        return partners
+
     def connect_faces_center_centers(
         self, start_fkey, end_fkeys, max_degrees=None,
     ):
@@ -295,3 +306,25 @@ class SpaceFrame(Mesh):
                 created_from=self.FROM_CONN_VERTICES,
                 parent_fkey=(start_fkey, end_fkey),
             )
+
+    def to_rglines(self):
+        lines = []
+
+        for u, v in self.edges():
+            pt_a, pt_b = self.edge_coordinates(u, v)
+            pt_a = rg.Point3d(*pt_a)
+            pt_b = rg.Point3d(*pt_b)
+            line = rg.Line(pt_a, pt_b)
+            lines.append(line)
+        return lines
+
+    def to_network(self):
+        network = Network()
+
+        for vkey in self.vertices():
+            x, y, z = self.vertex_coordinates(vkey)
+            network.add_node(x=x, y=y, z=z)
+        for u, v in self.edges():
+            network.add_edge(u, v)
+
+        return network
