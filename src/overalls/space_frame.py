@@ -44,8 +44,11 @@ class SpaceFrame(Mesh):
         for edge in self._extra_edges:
             yield (edge.u, edge.v)
 
+    def mesh_edges(self):
+        return super(SpaceFrame, self).edges()
+
     def edges(self):
-        return chain(super(SpaceFrame, self).edges(), self.extra_edges())
+        return chain(self.mesh_edges(), self.extra_edges())
 
     def add_edge(self, u, v, **kwattr):
         edge = ExtraEdge(u, v, **kwattr)
@@ -172,13 +175,11 @@ class SpaceFrame(Mesh):
         prefer_long=False,
     ):
         pt_cloud_dict = {}
-        pt_cloud_list = []
 
         for fkey in fkeys_search:
             x, y, z = self.face_center(fkey)
             pt = rg.Point3d(x, y, z)
             pt_cloud_dict[pt] = fkey
-            pt_cloud_list.append(pt)
 
         partners = []
 
@@ -308,15 +309,29 @@ class SpaceFrame(Mesh):
                 parent_fkey=(start_fkey, end_fkey),
             )
 
-    def to_rglines(self):
+    def edge_to_rgline(self, u, v):
+        pt_a, pt_b = self.edge_coordinates(u, v)
+        pt_a = rg.Point3d(*pt_a)
+        pt_b = rg.Point3d(*pt_b)
+        return rg.Line(pt_a, pt_b)
+
+    def to_rglines(self, separate_conn_lines=False):
         lines = []
 
-        for u, v in self.edges():
-            pt_a, pt_b = self.edge_coordinates(u, v)
-            pt_a = rg.Point3d(*pt_a)
-            pt_b = rg.Point3d(*pt_b)
-            line = rg.Line(pt_a, pt_b)
-            lines.append(line)
+        if separate_conn_lines:
+            conn_lines = []
+            for u, v in self.extra_edges():
+                conn_lines.append(self.edge_to_rgline(u, v))
+            edges = self.mesh_edges()
+        else:
+            edges = self.edges()
+
+        for u, v in edges:
+            lines.append(self.edge_to_rgline(u, v))
+
+        if separate_conn_lines:
+            return lines, conn_lines
+
         return lines
 
     def to_network(self):
