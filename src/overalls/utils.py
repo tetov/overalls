@@ -1,5 +1,4 @@
 import Rhino.Geometry as rg
-from compas.datastructures import Mesh
 from compas.datastructures import Network
 
 
@@ -14,21 +13,6 @@ def rglines_from_edges(mesh, nkeys=None):
         line = rg.Line(pt_a, pt_b)
         lines.append(line)
     return lines
-
-
-def to_compas_bugfix(mesh, cls=None):
-    if not cls:
-        cls = Mesh
-
-    faces = []
-    for face in mesh.faces:
-        if face[0] == face[-1]:
-            faces.append(face[:-1])
-        elif face[-2] == face[-1]:
-            faces.append(face[:-1])
-        else:
-            faces.append(face)
-    return cls.from_vertices_and_faces(mesh.vertices, faces)
 
 
 def meshes_to_network(meshes):

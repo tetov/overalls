@@ -6,25 +6,28 @@ from compas.datastructures import Mesh
 from compas.datastructures import Network
 from compas.geometry import Point
 from compas.geometry import Vector
+from compas.geometry import angle_vectors
+from overalls.utils import flatten
 from overalls.utils import is_in_domain
 from overalls.utils import to_list
 
 
 class ExtraEdge(object):
     def __init__(self, u, v, **kwattr):
-        self.keys = (u, v)
+        if u == v:
+            raise Exception("Need two different vertices to create an edge.")
+
+        self.u = u
+        self.v = v
+
         self.attr = kwattr
 
     @property
-    def u(self):
-        return self.keys[0]
-
-    @property
-    def v(self):
-        return self.keys[1]
+    def conn_dict(self):
+        return {self.u: self.v, self.v: self.u}
 
     def __eq__(self, other):
-        return set(self.keys) == set(other.keys)
+        return self.conn_dict == other.conn_dict
 
 
 class SpaceFrame(Mesh):
@@ -78,48 +81,143 @@ class SpaceFrame(Mesh):
         for fkey in fkeys:
             self.face_attributes(fkey, attr.keys(), attr.values())
 
-    def subdiv_faces(self, fkeys, n_iters, scheme=[0], **kwargs):
-        schemes = [self.face_subdiv_retriangulate, self.face_subdiv_frame]
+    def vertex_edges(self, u):
+        nbors = self.vertex_neighbors(u)
+        nbors += [
+            edge.conn_dict[u]
+            for edge in self.extra_edges()
+            if u in edge.conn_dict.keys()
+        ]
+
+        return [(u, v) for v in nbors]
+
+    def ok_vertex_degree(self, vkeys, max_degree):
+        vkeys = to_list(vkeys)
+        for vkey in vkeys:
+            if self.vertex_degree(vkey) > max_degree:
+                return False
+        return True
+
+    def ok_vertex_angles(self, vkeys, min_angle):
+        vkeys = flatten(to_list(vkeys))
+        for vkey in vkeys:
+            edges = self.vertex_edges(vkey)
+            vectors = [self.edge_vector(u, v) for u, v in edges]
+
+            for v in vectors:
+                to_check = [v1 for v1 in vectors if v1 != v]
+                for v1 in to_check:
+                    if abs(angle_vectors(v, v1, deg=True)) < min_angle:
+                        return False
+        return True
+
+    def ok_edge_length(self, ekeys, length_domain):
+        for u, v in ekeys:
+            if not is_in_domain(self.edge_length(u, v), length_domain):
+                return False
+        return True
+
+    def ok_subd(
+        self,
+        old_vkeys,
+        new_vkeys,
+        max_degree=None,
+        min_angle=None,
+        edge_length_domain=None,
+        **kwargs
+    ):
+        new_vkeys = to_list(new_vkeys)
+
+        if max_degree:
+            if not self.ok_vertex_degree(old_vkeys, max_degree):
+                return False
+
+        if min_angle:
+            if not self.ok_vertex_angles([old_vkeys + new_vkeys], min_angle):
+                return False
+
+        if edge_length_domain:
+            ekeys = [self.vertex_edges(vkey) for vkey in new_vkeys]
+            ekeys = flatten(ekeys)
+            uv_sets = set(frozenset((u, v)) for u, v in ekeys)  # unique edges
+            if not self.ok_edge_length(uv_sets, edge_length_domain):
+                return False
+
+        return True
+
+    def subdiv_faces(
+        self, fkeys, n_iters, scheme=[0], rel_pos=0.5, rel_pos_z=0.0, **kwargs
+    ):
+        schemes = [
+            self.face_subdiv_retriangulate,
+            self.face_subdiv_mid_cent,
+            self.face_subdiv_mids,
+            self.face_subdiv_frame,
+        ]
 
         repeating_n_iters = cycle(n_iters)
         repeating_schemes = cycle(scheme)
+        repeating_rel_pos = cycle(to_list(rel_pos))
+        repeating_rel_pos_z = cycle(to_list(rel_pos_z))
 
-        new_fkeys = []
+        new_subd_fkeys = []
         for fkey in fkeys:
             n_iters = next(repeating_n_iters)
+            kwargs.update({"rel_pos": next(repeating_rel_pos)})
+            kwargs.update({"rel_pos_z": next(repeating_rel_pos_z)})
+
             subdiv_func = schemes[next(repeating_schemes)]
 
             i = 0
             next_to_subd = [fkey]
             while i < n_iters:
+
                 to_subd = next_to_subd
                 next_to_subd = []
 
-                for fkey_prim in to_subd:
-                    _, returned_fkeys = subdiv_func(fkey_prim, **kwargs)
-                    next_to_subd += returned_fkeys
-                    new_fkeys += returned_fkeys
+                for parent_fkey in to_subd:
+                    parent_face_verts = self.face_vertices(parent_fkey)
+                    parent_attrs = self.face_attributes(parent_fkey)
+
+                    new_vkeys, new_fkeys = subdiv_func(parent_fkey, **kwargs)
+
+                    if not self.ok_subd(parent_face_verts, new_vkeys, **kwargs):
+                        self.undo_face_subd(
+                            new_fkeys, parent_fkey, parent_face_verts, parent_attrs
+                        )
+                        continue
+
+                    next_to_subd += new_fkeys
+                    new_subd_fkeys += new_fkeys
+
                 i += 1
+
+        self.cull_vertices()
 
         return [fkey for fkey in new_fkeys if self.has_face(fkey)]
 
-    def face_subdiv_retriangulate(self, fkey, move_z=0.0, rel_pos=None, **kwattr):
+    def face_subdiv_retriangulate(self, fkey, rel_pos=None, rel_pos_z=0.0, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
-        if rel_pos:
-            face_verts = list(self.face_vertices(fkey))
-            if len(rel_pos) != len(face_verts):
-                raise Exception(
-                    "Length of rel_pos not same as amount of face vertices."
-                )
-            for factor, vkey in zip(rel_pos, face_verts):
-                v_xyz = Point(*self.vertex_coordinates(vkey))
-                v = (xyz - v_xyz) * 2
-                xyz += v * factor
+        vecs = []
+        if rel_pos or rel_pos_z:
+            for v_xyz in self.face_coordinates(fkey):
+                vecs.append(xyz - Point(*v_xyz))
 
-        if move_z:
-            v = Vector(*self.face_normal(fkey))
-            xyz += v * move_z
+        if rel_pos:
+            rel_pos = cycle(to_list(rel_pos))
+            for v in vecs:
+                factor = next(rel_pos)
+                xyz -= v * factor
+
+        if rel_pos_z:
+            # set up max dist
+            dists = [v.length for v in vecs]
+            dists.sort()
+
+            normal = Vector(*self.face_normal(fkey, unitized=True))
+            z_vec = normal * dists[0] * rel_pos_z
+            xyz += z_vec
 
         vkey, fkeys = self.insert_vertex(fkey, xyz=list(xyz), return_fkeys=True)
 
@@ -131,6 +229,53 @@ class SpaceFrame(Mesh):
         # self.components_attributes(fkeys, [vkey], ekeys, data)
 
         return vkey, fkeys
+
+    def face_subdiv_mid_cent(self, fkey, rel_pos=None, rel_pos_z=0.0, **kwattr):
+        x, y, z = Point(*self.face_center(fkey))
+
+        new_vkey_center = self.add_vertex(x=x, y=y, z=z)
+
+        new_vkeys = []
+        for u in self.face_vertices(fkey):
+            v = self.face_vertex_descendant(fkey, u)
+            x, y, z = self.edge_midpoint(u, v)
+            new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
+
+        new_fkeys = []
+        for corner, mid in zip(self.face_vertices(fkey), new_vkeys):
+            vkeys = [corner, mid, new_vkey_center]
+            new_fkeys.append(self.add_face(vkeys))
+
+            next_corner = self.face_vertex_descendant(fkey, corner)
+            vkeys = [mid, next_corner, new_vkey_center]
+            new_fkeys.append(self.add_face(vkeys))
+
+        self.delete_face(fkey)
+
+        new_vkeys.append(new_vkey_center)
+
+        return new_vkeys, new_fkeys
+
+    def face_subdiv_mids(self, fkey, rel_pos=None, rel_poz_z=0.0, **kwattr):
+        new_vkeys = []
+        for u in self.face_vertices(fkey):
+            v = self.face_vertex_descendant(fkey, u)
+            x, y, z = self.edge_midpoint(u, v)
+            new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
+
+        new_fkeys = []
+        for i, corner in enumerate(self.face_vertices(fkey)):
+            prev_mid = new_vkeys[(i - 1) % len(new_vkeys)]
+            mid = new_vkeys[i]
+            vkeys = [prev_mid, corner, mid]
+            new_fkeys.append(self.add_face(vkeys))
+
+        # middle face
+        new_fkeys.append(self.add_face(new_vkeys))
+
+        self.delete_face(fkey)
+
+        return new_vkeys, new_fkeys
 
     def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **kwattr):
         if rel_dist == 1:
@@ -165,6 +310,15 @@ class SpaceFrame(Mesh):
         self.delete_face(fkey)
 
         return new_vkeys, new_fkeys
+
+    def undo_face_subd(self, new_fkeys, old_fkey, old_face_verts, old_attrs):
+        for fkey in new_fkeys:
+            try:
+                self.delete_face(fkey)
+            except KeyError:
+                pass
+
+        self.add_face(old_face_verts, fkey=old_fkey, attr_dict=old_attrs)
 
     def find_closest_faces(
         self,
@@ -217,7 +371,7 @@ class SpaceFrame(Mesh):
         return partners
 
     def connect_faces_center_centers(
-        self, start_fkey, end_fkeys, max_degrees=None,
+        self, start_fkey, end_fkeys, max_degree=None,
     ):
 
         # connect center to center
@@ -243,29 +397,9 @@ class SpaceFrame(Mesh):
         end_fkeys,
         rel_start_vkeys=None,
         rel_end_vkeys=None,
-        max_degrees=None,
+        max_degree=None,
     ):
-        """Create a line between a vertex on one mesh to a vertex on another.
-
-        Parameters
-        ----------
-        meshes : :obj:`list` of :class:`compas.datastructures.Mesh`
-            Mesh or meshes to connect.
-        fkeys_a : list of int or int
-            Face keys for faces on first mesh to connect. If length between fkeys_a
-            and fkeys_b differ the shorter list will be wrapped.
-        fkeys_a : list of int or int
-            Face keys for faces on second mesh to connect. If length between fkeys_a
-            and fkeys_b differ the shorter list will be wrapped.
-        relative_vkeys_a : list of int or int, optional
-            The face vertices on faces on mesh_a that will be connected.
-        relative_vkeys_b : list of int or int, optional
-            The face vertices on faces on mesh_b that will be connected.
-
-        Returns
-        -------
-        list of Rhino.Geometry.Line
-        """
+        """Create a line between a vertex on one mesh to a vertex on another."""
         start_fkeys = to_list(start_fkeys)
         end_fkeys = to_list(end_fkeys)
         if rel_start_vkeys:
@@ -296,9 +430,9 @@ class SpaceFrame(Mesh):
             u = start_vkeys[start_key_idx]
             v = end_vkeys[end_key_idx]
 
-            if max_degrees:
-                u_ok = self.vertex_degree(u) <= max_degrees
-                v_ok = self.vertex_degree(v) <= max_degrees
+            if max_degree:
+                u_ok = self.vertex_degree(u) <= max_degree
+                v_ok = self.vertex_degree(v) <= max_degree
                 if not u_ok or not v_ok:
                     continue
 
