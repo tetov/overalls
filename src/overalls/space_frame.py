@@ -1,4 +1,6 @@
-from itertools import chain
+import math
+from copy import copy
+from itertools import combinations
 from itertools import cycle
 
 import Rhino.Geometry as rg
@@ -6,109 +8,64 @@ from compas.datastructures import Mesh
 from compas.datastructures import Network
 from compas.geometry import Point
 from compas.geometry import Vector
-from compas.geometry import angle_vectors
+from compas.utilities import geometric_key
+from compas_rhino.geometry import RhinoLine
 from overalls.utils import flatten
 from overalls.utils import is_in_domain
 from overalls.utils import to_list
 
 
-class ExtraEdge(object):
-    def __init__(self, u, v, **kwattr):
-        if u == v:
-            raise Exception("Need two different vertices to create an edge.")
+class SpaceFrameMixin(object):
+    def connected_edges(self, key):
+        u = key
 
-        self.u = u
-        self.v = v
+        if isinstance(self, Network):
+            nbors = self.neighbors(u)
+        else:
+            nbors = self.vertex_neighbors(u)
 
-        self.attr = kwattr
+        for v in nbors:
+            yield (u, v)
 
-    @property
-    def conn_dict(self):
-        return {self.u: self.v, self.v: self.u}
+    def ok_degree(self, keys, max_degree):
+        if isinstance(self, Network):
+            degree_func = self.degree
+        else:
+            degree_func = self.vertex_degree
 
-    def __eq__(self, other):
-        return self.conn_dict == other.conn_dict
-
-
-class SpaceFrame(Mesh):
-    FROM_SUBD_TRI = 0
-    FROM_SUBD_FRAME = 1
-    FROM_CONN_CENTERS = 2
-    FROM_CONN_VERTICES = 3
-
-    def __init__(self):
-        super(SpaceFrame, self).__init__()
-        self.update_default_face_attributes(parent_fkey=None, created_from=None)
-        self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
-        self.update_default_edge_attributes(parent_fkey=None, created_from=None)
-        self._extra_edges = []
-
-    def extra_edges(self):
-        for edge in self._extra_edges:
-            yield (edge.u, edge.v)
-
-    def mesh_edges(self):
-        return super(SpaceFrame, self).edges()
-
-    def edges(self):
-        return chain(self.mesh_edges(), self.extra_edges())
-
-    def add_edge(self, u, v, **kwattr):
-        edge = ExtraEdge(u, v, **kwattr)
-        self._extra_edges.append(edge)
-
-    def edge_attributes(self, ekey, keys, values):
-        u, v = ekey
-        for edge in self.extra_edges():
-            tmp_obj = ExtraEdge(u, v)
-
-            if tmp_obj == edge:
-                new_attrs = {key: value for (key, value) in zip(keys, values)}
-                data = edge.attr
-                data.update(new_attrs)
-                edge.attr = data
-                break
-        super(SpaceFrame, self).edge_attributes((u, v), keys, values)
-
-    def edge_attribute(self, ekey, key, value):
-        self.edge_attributes(ekey, to_list(key), to_list(value))
-
-    def components_attributes(self, fkeys, vkeys, ekeys, attr):
-        for vkey in vkeys:
-            self.vertex_attributes(vkey, attr.keys(), attr.values())
-        for u, v in ekeys:
-            self.edge_attributes((u, v), attr.keys(), attr.values())
-        for fkey in fkeys:
-            self.face_attributes(fkey, attr.keys(), attr.values())
-
-    def vertex_edges(self, u):
-        nbors = self.vertex_neighbors(u)
-        nbors += [
-            edge.conn_dict[u]
-            for edge in self.extra_edges()
-            if u in edge.conn_dict.keys()
-        ]
-
-        return [(u, v) for v in nbors]
-
-    def ok_vertex_degree(self, vkeys, max_degree):
-        vkeys = to_list(vkeys)
-        for vkey in vkeys:
-            if self.vertex_degree(vkey) > max_degree:
+        keys = to_list(keys)
+        for key in keys:
+            if degree_func(key) > max_degree:
                 return False
         return True
 
-    def ok_vertex_angles(self, vkeys, min_angle):
-        vkeys = flatten(to_list(vkeys))
+    def ok_edges_angles(self, keys, min_angle, **kwargs):
+        vkeys = to_list(keys)
         for vkey in vkeys:
-            edges = self.vertex_edges(vkey)
-            vectors = [self.edge_vector(u, v) for u, v in edges]
+            if not self.ok_edge_angles(vkey, min_angle, **kwargs):
+                return False
+        return True
 
-            for v in vectors:
-                to_check = [v1 for v1 in vectors if v1 != v]
-                for v1 in to_check:
-                    if abs(angle_vectors(v, v1, deg=True)) < min_angle:
-                        return False
+    def ok_edge_angles(self, key, min_angle, additional_edge=None):
+        edges = list(self.connected_edges(key))
+
+        if additional_edge:
+            edges.append(additional_edge)
+
+        vectors = []
+        for u, v in edges:
+            if u != key:
+                u, v = v, u
+            vec = rg.Vector3d(*self.edge_vector(u, v))
+            vec.Unitize()
+            vectors.append(vec)
+
+        to_compare = combinations(range(len(vectors)), 2)
+        for v, v1 in list(to_compare):
+            v, v1 = vectors[v], vectors[v1]
+            if rg.Vector3d.VectorAngle(v, v1) < min_angle:
+                return False
+
         return True
 
     def ok_edge_length(self, ekeys, length_domain):
@@ -116,6 +73,220 @@ class SpaceFrame(Mesh):
             if not is_in_domain(self.edge_length(u, v), length_domain):
                 return False
         return True
+
+    def edge_to_rgline(self, u, v):
+        pt_a, pt_b = self.edge_coordinates(u, v)
+        pt_a = rg.Point3d(*pt_a)
+        pt_b = rg.Point3d(*pt_b)
+        return rg.Line(pt_a, pt_b)
+
+    def to_rglines(self):
+        lines = []
+
+        for u, v in self.edges():
+            lines.append(self.edge_to_rgline(u, v))
+
+        return lines
+
+
+class SpaceFrameNetwork(SpaceFrameMixin, Network):
+
+    FROM_MESH = 0
+    FROM_CONN = 1
+
+    def __init__(self):
+        super(SpaceFrameNetwork, self).__init__()
+        self.dist_dict = {}
+
+    def ensure_dist_dict(self):
+        if set(self.nodes()) != set(self.dist_dict.keys()):
+            self.build_dist_dict()
+
+    def build_dist_dict(self):
+        for nkey in self.nodes():
+            self.dist_dict[nkey] = {}
+
+        key_combinations = combinations(self.nodes(), 2)
+
+        for u, v in key_combinations:
+            x, y, z = self.node_coordinates(u)
+            x1, y1, z1 = self.node_coordinates(v)
+
+            dist = math.sqrt((x - x1) ** 2 + (y - y1) ** 2 + (z - z1) ** 2)
+
+            self.dist_dict[u][v] = dist
+            self.dist_dict[v][u] = dist
+
+    def find_closest_node(
+        self,
+        nkey_origin,
+        nkeys_search,
+        length_domain=None,
+        prefer_distant=False,
+        **kwargs
+    ):
+        self.ensure_dist_dict()
+        dists = copy(self.dist_dict[nkey_origin])
+
+        for nkey in self.dist_dict.keys():
+            if nkey == nkey_origin:
+                continue
+            if nkey not in nkeys_search:
+                # print("Not in search")
+                dists.pop(nkey)
+                continue
+            if nkey in self.neighbors(nkey_origin):
+                # print("in nbors")
+                dists.pop(nkey)
+                continue
+            if not is_in_domain(dists[nkey], length_domain):
+                # print("not in domain")
+                dists.pop(nkey)
+                continue
+
+        if len(dists) < 1:  # No matches
+            return None
+
+        dists = dists.items()
+        dists.sort(key=lambda x: x[1], reverse=prefer_distant)
+        keys, _ = zip(*dists)
+        return keys[0]
+
+    def ok_conn(self, u, v, max_degree, min_angle):
+        # print("Testing connection {}-{}".format(u, v))
+        if self.has_edge(u, v, directed=False):
+            print("Not ok_conn because has_edge")
+            return False
+
+        if max_degree:
+            if not self.ok_degree([u, v], max_degree):
+                # print("Not ok_conn because vertex_degree: {}-{}".format(u, v))
+                return False
+
+        if min_angle:
+            if not self.ok_edges_angles([u, v], min_angle, additional_edge=(u, v)):
+                # print("Not ok_conn because vertex_angles: {}-{}".format(u, v))
+                return False
+
+        # print("{}-{} passed ok_conn".format(u, v))
+        return True
+
+    def find_closest_nhood(
+        self,
+        nkey_origin,
+        nkeys_search,
+        n_results=3,
+        length_domain=None,
+        include_start_node=True,
+        **kwargs
+    ):
+        closest_nkey = self.find_closest_node(
+            nkey_origin, nkeys_search, length_domain=length_domain, **kwargs
+        )
+        nbors = []
+
+        if include_start_node:
+            nbors.append(closest_nkey)
+
+        rings = 1
+        nhood = []
+        while nhood < n_results:
+            nhood = self.neighborhood(closest_nkey, rings=rings)
+            rings += 1
+
+        nhood = nhood[:n_results]
+
+        for nkey in nhood:
+            if is_in_domain(self.dist_dict[nkey_origin][nkey], length_domain):
+                nbors.append(nkey)
+
+        return nbors
+
+    def connect_nodes(
+        self, start_nkey, end_nkeys, max_degree=None, min_angle=None, max_n_conn=None,
+    ):
+        """Create a line node to node."""
+        u = start_nkey
+        end_nkeys = to_list(end_nkeys)
+
+        n_conns = len(list(self.nodes_where({"created_from": self.FROM_CONN})))
+        for v in end_nkeys:
+            if v is None:
+                continue
+
+            if max_n_conn:
+                if n_conns > max_n_conn:
+                    break
+
+            # max_degree-1 because we will add one
+            if self.ok_conn(u, v, max_degree - 1, min_angle):
+                self.add_edge(
+                    u,
+                    v,
+                    created_from=self.FROM_CONN,
+                    # parent_fkey=(start_fkey, end_fkey),
+                )
+                n_conns += 1
+
+    @classmethod
+    def from_space_frame_mesh(cls, mesh):
+        network = cls()
+
+        for vkey in mesh.vertices():
+            x, y, z = mesh.vertex_coordinates(vkey)
+            # data = mesh.vertex_attributes(vkey)
+            # data.update({"created_from": cls.FROM_MESH})
+            network.add_node(key=vkey, x=x, y=y, z=z)
+
+        for u, v in mesh.edges():
+            # data = mesh.edge_attributes((u, v))
+            # data.update({"created_from": cls.FROM_MESH})
+            network.add_edge(u, v)
+
+        return network
+
+    @classmethod
+    def from_rglines(cls, lines, attr_dicts=None):
+        def add_node_if_needed(xyz, node_gkeys):
+            gkey = geometric_key(xyz)
+            nkey = node_gkeys.get(gkey)
+
+            if nkey is not None:
+                return nkey
+
+            x, y, z = xyz
+            nkey = cls.add_node(x=x, y=y, z=z, created_from=cls.FROM_LINES)
+            node_gkeys[gkey] = nkey
+
+            return nkey
+
+        network = cls()
+
+        node_gkeys = {}
+
+        for i, rgline in enumerate(lines):
+            line = RhinoLine.from_geometry(rgline).to_compas()
+            data = attr_dicts[i] if i < len(attr_dicts) else {}
+
+            data.update({"created_from": cls.FROM_MESH})
+
+            u = add_node_if_needed(list(line.start), node_gkeys)
+            v = add_node_if_needed(list(line.end), node_gkeys)
+
+            network.add_edge(u, v, attr_dict=data)
+
+        return network
+
+
+class SpaceFrameMesh(SpaceFrameMixin, Mesh):
+    FROM_SUBD_TRI = 0
+    FROM_SUBD_FRAME = 1
+
+    def __init__(self):
+        super(SpaceFrameMesh, self).__init__()
+        self.update_default_face_attributes(parent_fkey=None, created_from=None)
+        self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
+        self.update_default_edge_attributes(parent_fkey=None, created_from=None)
 
     def ok_subd(
         self,
@@ -129,15 +300,15 @@ class SpaceFrame(Mesh):
         new_vkeys = to_list(new_vkeys)
 
         if max_degree:
-            if not self.ok_vertex_degree(old_vkeys, max_degree):
+            if not self.ok_degree(old_vkeys, max_degree):
                 return False
 
         if min_angle:
-            if not self.ok_vertex_angles([old_vkeys + new_vkeys], min_angle):
+            if not self.ok_edges_angles(flatten([old_vkeys + new_vkeys]), min_angle):
                 return False
 
         if edge_length_domain:
-            ekeys = [self.vertex_edges(vkey) for vkey in new_vkeys]
+            ekeys = [self.connected_edges(vkey) for vkey in new_vkeys]
             ekeys = flatten(ekeys)
             uv_sets = set(frozenset((u, v)) for u, v in ekeys)  # unique edges
             if not self.ok_edge_length(uv_sets, edge_length_domain):
@@ -319,162 +490,3 @@ class SpaceFrame(Mesh):
                 pass
 
         self.add_face(old_face_verts, fkey=old_fkey, attr_dict=old_attrs)
-
-    def find_closest_faces(
-        self,
-        fkeys_origin,
-        fkeys_search,
-        n_face_connections=2,
-        dist_domain=(None, None),
-        prefer_long=False,
-    ):
-        pt_cloud_dict = {}
-
-        for fkey in fkeys_search:
-            x, y, z = self.face_center(fkey)
-            pt = rg.Point3d(x, y, z)
-            pt_cloud_dict[pt] = fkey
-
-        partners = []
-
-        for fkey in fkeys_origin:
-            dists = []
-            x, y, z = self.face_center(fkey)
-            pt1 = rg.Point3d(x, y, z)
-
-            for pt2, key in pt_cloud_dict.iteritems():
-                if key == fkey or key in self.face_neighbors(fkey):
-                    continue
-                dist = pt1.DistanceTo(pt2)
-                if is_in_domain(dist, dist_domain):
-                    dists.append((key, dist))
-
-            if len(dists) < 1:  # No matches
-                continue
-
-            dists.sort(key=lambda x: x[1], reverse=prefer_long)
-            keys, _ = zip(*dists)
-            partners.append((fkey, keys[:n_face_connections]))
-        return partners
-
-    def find_closest_face_nhood(self, fkeys_origin, fkeys_search, *args, **kwargs):
-        original_partners = self.find_closest_faces(
-            fkeys_origin, fkeys_search, *args, **kwargs
-        )
-
-        partners = []
-        for partner_a, partners_b in original_partners:
-            nbors = set()
-            for partner in partners_b:
-                nbors.update(self.face_neighbors(partner))
-            partners.append((partner_a, list(nbors)))
-        return partners
-
-    def connect_faces_center_centers(
-        self, start_fkey, end_fkeys, max_degree=None,
-    ):
-
-        # connect center to center
-        x, y, z = self.face_center(start_fkey)
-        start_vkey, _ = self.face_subdiv_retriangulate(
-            start_fkey, created_from=self.FROM_CONN_CENTERS
-        )
-
-        for fkey in end_fkeys:
-            vkey, _ = self.face_subdiv_retriangulate(
-                fkey, return_vkey=True, created_from=self.FROM_CONN_CENTERS
-            )
-            self.add_edge(
-                start_vkey,
-                vkey,
-                created_from=self.FROM_CONN_CENTERS,
-                parent_fkey=(start_fkey, fkey),
-            )
-
-    def connect_faces_vert_vert(
-        self,
-        start_fkeys,
-        end_fkeys,
-        rel_start_vkeys=None,
-        rel_end_vkeys=None,
-        max_degree=None,
-    ):
-        """Create a line between a vertex on one mesh to a vertex on another."""
-        start_fkeys = to_list(start_fkeys)
-        end_fkeys = to_list(end_fkeys)
-        if rel_start_vkeys:
-            rel_start_vkeys = to_list(rel_start_vkeys)
-        if rel_end_vkeys:
-            rel_end_vkeys = to_list(rel_end_vkeys)
-
-        max_iters = max(len(start_fkeys), len(end_fkeys))
-
-        for j in range(max_iters):
-            start_fkey = start_fkeys[j % len(start_fkeys)]
-            end_fkey = end_fkeys[j % len(end_fkeys)]
-
-            start_vkeys = self.face_vertices(start_fkey)
-            end_vkeys = self.face_vertices(end_fkey)
-
-            if rel_start_vkeys:
-                start_key_idx = rel_start_vkeys[j % len(rel_start_vkeys)]
-            else:
-                start_vkeys.sort(key=lambda x: self.vertex_degree(x))
-                start_key_idx = 0
-            if rel_end_vkeys:
-                end_key_idx = rel_end_vkeys[j % len(rel_end_vkeys)]
-            else:
-                end_vkeys.sort(key=lambda x: self.vertex_degree(x))
-                end_key_idx = 0
-
-            u = start_vkeys[start_key_idx]
-            v = end_vkeys[end_key_idx]
-
-            if max_degree:
-                u_ok = self.vertex_degree(u) <= max_degree
-                v_ok = self.vertex_degree(v) <= max_degree
-                if not u_ok or not v_ok:
-                    continue
-
-            self.add_edge(
-                u,
-                v,
-                created_from=self.FROM_CONN_VERTICES,
-                parent_fkey=(start_fkey, end_fkey),
-            )
-
-    def edge_to_rgline(self, u, v):
-        pt_a, pt_b = self.edge_coordinates(u, v)
-        pt_a = rg.Point3d(*pt_a)
-        pt_b = rg.Point3d(*pt_b)
-        return rg.Line(pt_a, pt_b)
-
-    def to_rglines(self, separate_conn_lines=False):
-        lines = []
-
-        if separate_conn_lines:
-            conn_lines = []
-            for u, v in self.extra_edges():
-                conn_lines.append(self.edge_to_rgline(u, v))
-            edges = self.mesh_edges()
-        else:
-            edges = self.edges()
-
-        for u, v in edges:
-            lines.append(self.edge_to_rgline(u, v))
-
-        if separate_conn_lines:
-            return lines, conn_lines
-
-        return lines
-
-    def to_network(self):
-        network = Network()
-
-        for vkey in self.vertices():
-            x, y, z = self.vertex_coordinates(vkey)
-            network.add_node(x=x, y=y, z=z)
-        for u, v in self.edges():
-            network.add_edge(u, v)
-
-        return network
