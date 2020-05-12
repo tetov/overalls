@@ -80,10 +80,13 @@ class SpaceFrameMixin(object):
         pt_b = rg.Point3d(*pt_b)
         return rg.Line(pt_a, pt_b)
 
-    def to_rglines(self):
+    def to_rglines(self, ekeys=None):
+        if ekeys is None:
+            ekeys = self.edges()
+
         lines = []
 
-        for u, v in self.edges():
+        for u, v in ekeys:
             lines.append(self.edge_to_rgline(u, v))
 
         return lines
@@ -93,10 +96,13 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
 
     FROM_MESH = 0
     FROM_CONN = 1
+    FROM_LINES = 2
 
     def __init__(self):
         super(SpaceFrameNetwork, self).__init__()
         self.dist_dict = {}
+        self.update_default_edge_attributes(created_from=None)
+        self.update_default_node_attributes(created_from=None)
 
     def ensure_dist_dict(self):
         if set(self.nodes()) != set(self.dist_dict.keys()):
@@ -155,7 +161,7 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
     def ok_conn(self, u, v, max_degree, min_angle):
         # print("Testing connection {}-{}".format(u, v))
         if self.has_edge(u, v, directed=False):
-            print("Not ok_conn because has_edge")
+            # print("Not ok_conn because has_edge")
             return False
 
         if max_degree:
@@ -245,20 +251,22 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
 
         return network
 
-    @classmethod
-    def from_rglines(cls, lines, attr_dicts=None):
-        def add_node_if_needed(xyz, node_gkeys):
-            gkey = geometric_key(xyz)
-            nkey = node_gkeys.get(gkey)
+    @staticmethod
+    def _add_node_if_needed(network, xyz, node_gkeys, data={}):
+        gkey = geometric_key(xyz)
+        nkey = node_gkeys.get(gkey)
 
-            if nkey is not None:
-                return nkey
-
-            x, y, z = xyz
-            nkey = cls.add_node(x=x, y=y, z=z, created_from=cls.FROM_LINES)
-            node_gkeys[gkey] = nkey
-
+        if nkey is not None:
             return nkey
+
+        x, y, z = xyz
+        nkey = network.add_node(x=x, y=y, z=z, attr_dict=data)
+        node_gkeys[gkey] = nkey
+
+        return nkey
+
+    @classmethod
+    def from_rglines(cls, lines, attr_dicts=[]):
 
         network = cls()
 
@@ -268,10 +276,10 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
             line = RhinoLine.from_geometry(rgline).to_compas()
             data = attr_dicts[i] if i < len(attr_dicts) else {}
 
-            data.update({"created_from": cls.FROM_MESH})
+            data.update({"created_from": cls.FROM_LINES})
 
-            u = add_node_if_needed(list(line.start), node_gkeys)
-            v = add_node_if_needed(list(line.end), node_gkeys)
+            u = cls._add_node_if_needed(network, list(line.start), node_gkeys, data)
+            v = cls._add_node_if_needed(network, list(line.end), node_gkeys, data)
 
             network.add_edge(u, v, attr_dict=data)
 
@@ -287,6 +295,24 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         self.update_default_face_attributes(parent_fkey=None, created_from=None)
         self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
         self.update_default_edge_attributes(parent_fkey=None, created_from=None)
+
+    def delete_face(self, fkey):
+        try:
+            super(SpaceFrameMesh, self).delete_face(fkey)
+        except KeyError:
+            pass
+
+    def collapse_edges(self, min_edge_length):
+        edges = set(list(self.edges()))
+        # print(len(edges))
+        edges -= set(self.edges_on_boundary(oriented=True))
+        edges = [(u, v) for u, v in edges if self.edge_length(u, v) < min_edge_length]
+
+        for u, v in edges:
+            if self.has_edge((u, v)) and self.has_vertex(u) and self.has_vertex(v):
+                # t = 0 if self.vertex_degree(u) < self.vertex_degree(v) else 1
+                t = 0.5
+                self.collapse_edge(u, v, t=t)
 
     def ok_subd(
         self,
@@ -316,28 +342,57 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return True
 
+    def _move_pt_relative(self, pt, fkey, rel_pos, rel_pos_z):
+        if not rel_pos and not rel_pos_z:
+            return pt
+
+        vecs = []
+        for v_xyz in self.face_coordinates(fkey):
+            vecs.append(pt - Point(*v_xyz))
+
+        if rel_pos:
+            rel_pos = cycle(to_list(rel_pos))
+            for v in vecs:
+                factor = next(rel_pos)
+                pt -= v * factor
+
+        if rel_pos_z:
+            # set up max dist
+            dists = [v.length for v in vecs]
+            dists.sort()
+
+            normal = Vector(*self.face_normal(fkey, unitized=True))
+            z_vec = normal * dists[0] * rel_pos_z
+            pt += z_vec
+
+        return pt
+
     def subdiv_faces(
-        self, fkeys, n_iters, scheme=[0], rel_pos=0.5, rel_pos_z=0.0, **kwargs
+        self, fkeys, n_iters, scheme=[0], rel_pos=None, rel_pos_z=None, **kwargs
     ):
-        schemes = [
-            self.face_subdiv_retriangulate,
+        subdiv_funcs = [
+            self.face_subdiv_pyramid,
             self.face_subdiv_mid_cent,
             self.face_subdiv_mids,
+            self.face_subdiv_split,
             self.face_subdiv_frame,
         ]
-
         repeating_n_iters = cycle(n_iters)
-        repeating_schemes = cycle(scheme)
-        repeating_rel_pos = cycle(to_list(rel_pos))
-        repeating_rel_pos_z = cycle(to_list(rel_pos_z))
+        subdiv_cycler = cycle(scheme)
+        repeating_rel_pos = cycle(to_list(rel_pos)) if rel_pos else None
+        repeating_rel_pos_z = cycle(to_list(rel_pos_z)) if rel_pos_z else None
 
         new_subd_fkeys = []
         for fkey in fkeys:
             n_iters = next(repeating_n_iters)
-            kwargs.update({"rel_pos": next(repeating_rel_pos)})
-            kwargs.update({"rel_pos_z": next(repeating_rel_pos_z)})
+            if repeating_rel_pos:
+                kwargs.update({"rel_pos": next(repeating_rel_pos)})
+            if repeating_rel_pos_z:
+                kwargs.update({"rel_pos_z": next(repeating_rel_pos_z)})
 
-            subdiv_func = schemes[next(repeating_schemes)]
+            subdiv_parent_face = next(subdiv_cycler)
+            if not hasattr(subdiv_parent_face, "__next__"):
+                subdiv_parent_face = cycle(to_list(subdiv_parent_face))
 
             i = 0
             next_to_subd = [fkey]
@@ -346,9 +401,17 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 to_subd = next_to_subd
                 next_to_subd = []
 
+                subdiv_iteration = next(subdiv_parent_face)
+                if not hasattr(subdiv_iteration, "__next__"):
+                    subdiv_iteration = cycle(to_list(subdiv_iteration))
+
                 for parent_fkey in to_subd:
                     parent_face_verts = self.face_vertices(parent_fkey)
                     parent_attrs = self.face_attributes(parent_fkey)
+
+                    subdiv_child_face = next(subdiv_iteration)
+
+                    subdiv_func = subdiv_funcs[subdiv_child_face]
 
                     new_vkeys, new_fkeys = subdiv_func(parent_fkey, **kwargs)
 
@@ -367,75 +430,80 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return [fkey for fkey in new_fkeys if self.has_face(fkey)]
 
-    def face_subdiv_retriangulate(self, fkey, rel_pos=None, rel_pos_z=0.0, **kwattr):
+    def face_subdiv_pyramid(self, fkey, rel_pos=None, rel_pos_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
-        vecs = []
-        if rel_pos or rel_pos_z:
-            for v_xyz in self.face_coordinates(fkey):
-                vecs.append(xyz - Point(*v_xyz))
+        x, y, z = self._move_pt_relative(xyz, fkey, rel_pos, rel_pos_z)
 
-        if rel_pos:
-            rel_pos = cycle(to_list(rel_pos))
-            for v in vecs:
-                factor = next(rel_pos)
-                xyz -= v * factor
+        face_vertices = self.face_vertices(fkey)
+        self.delete_face(fkey)
 
-        if rel_pos_z:
-            # set up max dist
-            dists = [v.length for v in vecs]
-            dists.sort()
+        new_vkey = self.add_vertex(x=x, y=y, z=z)
 
-            normal = Vector(*self.face_normal(fkey, unitized=True))
-            z_vec = normal * dists[0] * rel_pos_z
-            xyz += z_vec
+        new_fkeys = []
+        for i, vkey in enumerate(face_vertices):
+            next_vkey = face_vertices[(i + 1) % len(face_vertices)]
+            vkeys = [vkey, next_vkey, new_vkey]
+            new_fkeys.append(vkeys)
 
-        vkey, fkeys = self.insert_vertex(fkey, xyz=list(xyz), return_fkeys=True)
+        # ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]  # noqa: F841
 
-        ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]  # noqa: F841
-
-        data = kwattr
-        data.update({"parent_fkey": fkey})
+        # data = kwattr
+        # data.update({"parent_fkey": fkey})
 
         # self.components_attributes(fkeys, [vkey], ekeys, data)
 
-        return vkey, fkeys
+        return [new_vkey], new_fkeys
 
     def face_subdiv_mid_cent(self, fkey, rel_pos=None, rel_pos_z=0.0, **kwattr):
-        x, y, z = Point(*self.face_center(fkey))
+        xyz = Point(*self.face_center(fkey))
+
+        x, y, z = self._move_pt_relative(xyz, fkey, rel_pos, rel_pos_z)
+
+        face_vertices = self.face_vertices(fkey)
+
+        self.delete_face(fkey)
 
         new_vkey_center = self.add_vertex(x=x, y=y, z=z)
 
         new_vkeys = []
-        for u in self.face_vertices(fkey):
-            v = self.face_vertex_descendant(fkey, u)
+        for i, u in enumerate(face_vertices):
+            v = face_vertices[(i + 1) % len(face_vertices)]
             x, y, z = self.edge_midpoint(u, v)
             new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
 
         new_fkeys = []
-        for corner, mid in zip(self.face_vertices(fkey), new_vkeys):
-            vkeys = [corner, mid, new_vkey_center]
+        zip_verts = list(zip(face_vertices, new_vkeys))
+        for i in range(len(zip_verts)):
+            old_key, new_key = zip_verts[i]
+            vkeys = [old_key, new_key, new_vkey_center]
             new_fkeys.append(self.add_face(vkeys))
 
-            next_corner = self.face_vertex_descendant(fkey, corner)
-            vkeys = [mid, next_corner, new_vkey_center]
+            next_old_key = face_vertices[(i + 1) % len(face_vertices)]
+            vkeys = [new_key, next_old_key, new_vkey_center]
             new_fkeys.append(self.add_face(vkeys))
-
-        self.delete_face(fkey)
 
         new_vkeys.append(new_vkey_center)
 
         return new_vkeys, new_fkeys
 
-    def face_subdiv_mids(self, fkey, rel_pos=None, rel_poz_z=0.0, **kwattr):
+    def face_subdiv_mids(self, fkey, **kwattr):
+        # remove rel_pos and rel_pos_z since they don't apply
+        kwattr.pop("rel_pos", None)
+        kwattr.pop("rel_pos_z", None)
+
+        face_vertices = self.face_vertices(fkey)
+
+        self.delete_face(fkey)
+
         new_vkeys = []
-        for u in self.face_vertices(fkey):
-            v = self.face_vertex_descendant(fkey, u)
+        for i, u in enumerate(face_vertices):
+            v = face_vertices[(i + 1) % len(face_vertices)]
             x, y, z = self.edge_midpoint(u, v)
             new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
 
         new_fkeys = []
-        for i, corner in enumerate(self.face_vertices(fkey)):
+        for i, corner in enumerate(face_vertices):
             prev_mid = new_vkeys[(i - 1) % len(new_vkeys)]
             mid = new_vkeys[i]
             vkeys = [prev_mid, corner, mid]
@@ -444,13 +512,52 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         # middle face
         new_fkeys.append(self.add_face(new_vkeys))
 
+        return new_vkeys, new_fkeys
+
+    def face_subdiv_split(self, fkey, **kwattr):
+        # remove rel_pos and rel_pos_z since they don't apply
+        kwattr.pop("rel_pos", None)
+        kwattr.pop("rel_pos_z", None)
+
+        # data = self.face_attributes(fkey)
+        # data.update(kwattr)
+
+        vkeys = self.face_vertices(fkey)
+
         self.delete_face(fkey)
 
-        return new_vkeys, new_fkeys
+        ekeys = []
+        for i, u in enumerate(vkeys):
+            ekeys.append((u, vkeys[(i + 1) % len(vkeys)]))
+
+        ekeys.sort(key=lambda ekey: self.edge_length(*ekey), reverse=True)
+
+        u1, v1 = ekeys[0]
+        x, y, z = self.edge_midpoint(u1, v1)
+
+        v_mid1 = self.add_vertex(x=x, y=y, z=z)
+
+        new_fkeys = []
+        if len(vkeys) == 3:
+            v1, v2, v3 = vkeys
+            new_fkeys.append(self.add_face([v_mid1, v2, v3]))
+            new_fkeys.append(self.add_face([v_mid1, v3, v1]))
+            return [v_mid1], new_fkeys
+
+        u2v2 = [(u, v) for u, v in ekeys if u not in (u1, v1) and v not in (u1, v1)]
+        u2, v2 = u2v2[0]
+
+        x, y, z = self.edge_midpoint(u2, v2)
+        v_mid2 = self.add_vertex(x=x, y=y, z=z)
+
+        new_fkeys.append(self.add_face([v1, v_mid1, v_mid2, u2]))
+        new_fkeys.append(self.add_face([v2, v_mid2, v_mid1, u1]))
+
+        return [v_mid1, v_mid2], new_fkeys
 
     def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **kwattr):
         if rel_dist == 1:
-            return self.face_subdiv_retriangulate(fkey, move_z=move_z ** kwattr)
+            return self.face_subdiv_pyramid(fkey, move_z=move_z ** kwattr)
         if rel_dist == 0:
             raise Exception("rel_dist can't be 0")
 
@@ -478,15 +585,10 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         # add new center face
         new_fkeys.append(self.add_face(new_vkeys))
 
-        self.delete_face(fkey)
-
         return new_vkeys, new_fkeys
 
     def undo_face_subd(self, new_fkeys, old_fkey, old_face_verts, old_attrs):
         for fkey in new_fkeys:
-            try:
-                self.delete_face(fkey)
-            except KeyError:
-                pass
+            self.delete_face(fkey)
 
         self.add_face(old_face_verts, fkey=old_fkey, attr_dict=old_attrs)
