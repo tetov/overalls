@@ -296,11 +296,13 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
         self.update_default_edge_attributes(parent_fkey=None, created_from=None)
 
+    """
     def delete_face(self, fkey):
         try:
             super(SpaceFrameMesh, self).delete_face(fkey)
         except KeyError:
             pass
+
 
     def collapse_edges(self, min_edge_length):
         edges = set(list(self.edges()))
@@ -313,6 +315,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 # t = 0 if self.vertex_degree(u) < self.vertex_degree(v) else 1
                 t = 0.5
                 self.collapse_edge(u, v, t=t)
+        """
 
     def ok_subd(
         self,
@@ -342,33 +345,28 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return True
 
-    def _move_pt_relative(self, pt, fkey, rel_pos, rel_pos_z):
-        if not rel_pos and not rel_pos_z:
+    def _move_center_pt(self, pt, fkey, rel_pos, move_z):
+        if not rel_pos and not move_z:
             return pt
-
-        vecs = []
-        for v_xyz in self.face_coordinates(fkey):
-            vecs.append(pt - Point(*v_xyz))
 
         if rel_pos:
             rel_pos = cycle(to_list(rel_pos))
-            for v in vecs:
+            for v_xyz in self.face_coordinates(fkey):
+                v = pt - Point(*v_xyz)
+
                 factor = next(rel_pos)
-                pt -= v * factor
+                pt += v * factor
 
-        if rel_pos_z:
+        if move_z:
             # set up max dist
-            dists = [v.length for v in vecs]
-            dists.sort()
-
             normal = Vector(*self.face_normal(fkey, unitized=True))
-            z_vec = normal * dists[0] * rel_pos_z
+            z_vec = normal * move_z
             pt += z_vec
 
         return pt
 
     def subdiv_faces(
-        self, fkeys, n_iters, scheme=[0], rel_pos=None, rel_pos_z=None, **kwargs
+        self, fkeys, n_iters, scheme=[0], rel_pos=None, move_z=None, **kwargs
     ):
         subdiv_funcs = [
             self.face_subdiv_pyramid,
@@ -380,15 +378,15 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         repeating_n_iters = cycle(n_iters)
         subdiv_cycler = cycle(scheme)
         repeating_rel_pos = cycle(to_list(rel_pos)) if rel_pos else None
-        repeating_rel_pos_z = cycle(to_list(rel_pos_z)) if rel_pos_z else None
+        repeating_move_z = cycle(to_list(move_z)) if move_z else None
 
         new_subd_fkeys = []
         for fkey in fkeys:
             n_iters = next(repeating_n_iters)
             if repeating_rel_pos:
                 kwargs.update({"rel_pos": next(repeating_rel_pos)})
-            if repeating_rel_pos_z:
-                kwargs.update({"rel_pos_z": next(repeating_rel_pos_z)})
+            if repeating_move_z:
+                kwargs.update({"move_z": next(repeating_move_z)})
 
             subdiv_parent_face = next(subdiv_cycler)
             if not hasattr(subdiv_parent_face, "__next__"):
@@ -430,60 +428,49 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return [fkey for fkey in new_fkeys if self.has_face(fkey)]
 
-    def face_subdiv_pyramid(self, fkey, rel_pos=None, rel_pos_z=None, **kwattr):
+    def face_subdiv_pyramid(self, fkey, rel_pos=None, move_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
-        x, y, z = self._move_pt_relative(xyz, fkey, rel_pos, rel_pos_z)
+        x, y, z = self._move_center_pt(xyz, fkey, rel_pos, move_z)
 
-        face_vertices = self.face_vertices(fkey)
+        face_halfedges = self.face_halfedges(fkey)
+
         self.delete_face(fkey)
 
-        new_vkey = self.add_vertex(x=x, y=y, z=z)
+        center_vkey = self.add_vertex(x=x, y=y, z=z)
 
         new_fkeys = []
-        for i, vkey in enumerate(face_vertices):
-            next_vkey = face_vertices[(i + 1) % len(face_vertices)]
-            vkeys = [vkey, next_vkey, new_vkey]
-            new_fkeys.append(vkeys)
+        for u, v in face_halfedges:
+            vkeys = [u, v, center_vkey]
+            new_fkeys.append(self.add_face(vkeys))
 
-        # ekeys = [(vkey, v) for v in self.vertex_neighbors(vkey)]  # noqa: F841
+        return [center_vkey], new_fkeys
 
-        # data = kwattr
-        # data.update({"parent_fkey": fkey})
-
-        # self.components_attributes(fkeys, [vkey], ekeys, data)
-
-        return [new_vkey], new_fkeys
-
-    def face_subdiv_mid_cent(self, fkey, rel_pos=None, rel_pos_z=0.0, **kwattr):
+    def face_subdiv_mid_cent(self, fkey, rel_pos=None, move_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
-        x, y, z = self._move_pt_relative(xyz, fkey, rel_pos, rel_pos_z)
+        x, y, z = self._move_center_pt(xyz, fkey, rel_pos, move_z)
 
         face_vertices = self.face_vertices(fkey)
+        face_halfedges = self.face_halfedges(fkey)
 
         self.delete_face(fkey)
 
-        new_vkey_center = self.add_vertex(x=x, y=y, z=z)
+        center_vkey = self.add_vertex(x=x, y=y, z=z)
 
         new_vkeys = []
-        for i, u in enumerate(face_vertices):
-            v = face_vertices[(i + 1) % len(face_vertices)]
+        for u, v in face_halfedges:
             x, y, z = self.edge_midpoint(u, v)
             new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
 
         new_fkeys = []
-        zip_verts = list(zip(face_vertices, new_vkeys))
-        for i in range(len(zip_verts)):
-            old_key, new_key = zip_verts[i]
-            vkeys = [old_key, new_key, new_vkey_center]
+        for i, face_vertex in enumerate(face_vertices):
+            edge_mid = new_vkeys[i]
+            prev_edge_mid = new_vkeys[(i - 1) % len(new_vkeys)]
+            vkeys = [face_vertex, edge_mid, center_vkey, prev_edge_mid]
             new_fkeys.append(self.add_face(vkeys))
 
-            next_old_key = face_vertices[(i + 1) % len(face_vertices)]
-            vkeys = [new_key, next_old_key, new_vkey_center]
-            new_fkeys.append(self.add_face(vkeys))
-
-        new_vkeys.append(new_vkey_center)
+        new_vkeys.append(center_vkey)
 
         return new_vkeys, new_fkeys
 
@@ -492,21 +479,21 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
 
+        face_halfedges = self.face_halfedges(fkey)
         face_vertices = self.face_vertices(fkey)
 
         self.delete_face(fkey)
 
         new_vkeys = []
-        for i, u in enumerate(face_vertices):
-            v = face_vertices[(i + 1) % len(face_vertices)]
+        for u, v in face_halfedges:
             x, y, z = self.edge_midpoint(u, v)
             new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
 
         new_fkeys = []
-        for i, corner in enumerate(face_vertices):
-            prev_mid = new_vkeys[(i - 1) % len(new_vkeys)]
-            mid = new_vkeys[i]
-            vkeys = [prev_mid, corner, mid]
+        for i, face_vertex in enumerate(face_vertices):
+            prev_edge_mid = new_vkeys[(i - 1) % len(new_vkeys)]
+            edge_mid = new_vkeys[i]
+            vkeys = [prev_edge_mid, face_vertex, edge_mid]
             new_fkeys.append(self.add_face(vkeys))
 
         # middle face
@@ -514,71 +501,105 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return new_vkeys, new_fkeys
 
-    def face_subdiv_split(self, fkey, **kwattr):
+    def face_subdiv_split(
+        self, fkey, tri_split_equal=True, shift_split=False, **kwattr
+    ):
         # remove rel_pos and rel_pos_z since they don't apply
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
 
-        # data = self.face_attributes(fkey)
-        # data.update(kwattr)
+        face_vertices = self.face_vertices(fkey)
+        face_halfedges = self.face_halfedges(fkey)
+        # print("fkeys: {}, halfedges: {}".format(face_vertices, face_halfedges))
+        self.delete_face(fkey)
 
-        vkeys = self.face_vertices(fkey)
+        u1, v1 = face_halfedges[0 + shift_split]
+        x, y, z = self.edge_midpoint(u1, v1)
+
+        e_mid1 = self.add_vertex(x=x, y=y, z=z)
+
+        new_vkeys = [e_mid1]
+        new_fkeys = []
+        if len(face_vertices) == 3:
+            u2, v2 = face_halfedges[1 + shift_split]
+            if tri_split_equal:
+                # tri split in half
+
+                new_face_verts1 = [u1, e_mid1, v2]
+                new_face_verts2 = [e_mid1, v1, v2]
+            else:
+                # tri face split into one quad and one tri
+
+                x, y, z = self.edge_midpoint(u2, v2)
+                e_mid2 = self.add_vertex(x=x, y=y, z=z, attr_dicts=kwattr)
+
+                new_face_verts1 = [u1, e_mid1, e_mid2, v2]
+                new_face_verts2 = [e_mid1, u2, e_mid2]
+
+                new_vkeys.append(e_mid2)
+
+        else:
+            # Quad face into two smaller quad faces
+
+            # Get edge opposite (u1, v1)
+            u2, v2 = face_halfedges[2 + shift_split]
+
+            x, y, z = self.edge_midpoint(u2, v2)
+            e_mid2 = self.add_vertex(x=x, y=y, z=z)
+
+            new_face_verts1 = [u1, e_mid1, e_mid2, v2]
+            new_face_verts2 = [e_mid1, v1, u2, e_mid2]
+
+            new_vkeys.append(e_mid2)
+
+        new_fkeys.append(self.add_face(new_face_verts1))
+        new_fkeys.append(self.add_face(new_face_verts2))
+
+        return new_vkeys, new_fkeys
+
+    def face_subdiv_frame(self, fkey, rel_pos=None, move_z=None, **kwattr):
+        if rel_pos == 1 or rel_pos == [1, 1, 1]:
+            return self.face_subdiv_pyramid(fkey, move_z=move_z, **kwattr)
+
+        face_center_pt = Point(*self.face_center(fkey))
+        face_normal = Vector(*self.face_normal(fkey))
+        face_coordinates = self.face_coordinates(fkey)
+        face_halfedges = self.face_halfedges(fkey)
 
         self.delete_face(fkey)
 
-        ekeys = []
-        for i, u in enumerate(vkeys):
-            ekeys.append((u, vkeys[(i + 1) % len(vkeys)]))
+        if move_z is None:
+            move_z = cycle(to_list(0))
 
-        ekeys.sort(key=lambda ekey: self.edge_length(*ekey), reverse=True)
+        if not isinstance(move_z, cycle):
+            move_z = cycle(to_list(move_z))
 
-        u1, v1 = ekeys[0]
-        x, y, z = self.edge_midpoint(u1, v1)
+        if rel_pos is None:
+            rel_pos = cycle(to_list(0.5))
 
-        v_mid1 = self.add_vertex(x=x, y=y, z=z)
-
-        new_fkeys = []
-        if len(vkeys) == 3:
-            v1, v2, v3 = vkeys
-            new_fkeys.append(self.add_face([v_mid1, v2, v3]))
-            new_fkeys.append(self.add_face([v_mid1, v3, v1]))
-            return [v_mid1], new_fkeys
-
-        u2v2 = [(u, v) for u, v in ekeys if u not in (u1, v1) and v not in (u1, v1)]
-        u2, v2 = u2v2[0]
-
-        x, y, z = self.edge_midpoint(u2, v2)
-        v_mid2 = self.add_vertex(x=x, y=y, z=z)
-
-        new_fkeys.append(self.add_face([v1, v_mid1, v_mid2, u2]))
-        new_fkeys.append(self.add_face([v2, v_mid2, v_mid1, u1]))
-
-        return [v_mid1, v_mid2], new_fkeys
-
-    def face_subdiv_frame(self, fkey, move_z=False, rel_dist=0.5, **kwattr):
-        if rel_dist == 1:
-            return self.face_subdiv_pyramid(fkey, move_z=move_z ** kwattr)
-        if rel_dist == 0:
-            raise Exception("rel_dist can't be 0")
-
-        face_center_pt = Point(*self.face_center(fkey))
+        if not isinstance(rel_pos, cycle):
+            rel_pos = cycle(to_list(rel_pos))
 
         new_vkeys = []
-        for x, y, z in self.face_coordinates(fkey):
+        for x, y, z in face_coordinates:
             pt = Point(x, y, z)
+            factor = next(rel_pos)
 
             v = face_center_pt - pt
-            pt += v * rel_dist
+            pt += v * factor
+            if move_z:
+                z_factor = next(move_z)
+                pt += face_normal * z_factor
             new_vkeys.append(self.add_vertex(x=pt.x, y=pt.y, z=pt.z))
 
-        face_verts = self.face_vertices(fkey)
         new_fkeys = []
-        for j in range(len(face_verts)):
+        for i, uv in enumerate(face_halfedges):
+            u, v = uv
             vkeys = []
-            vkeys.append(face_verts[j])
-            vkeys.append(face_verts[(j + 1) % len(face_verts)])
-            vkeys.append(new_vkeys[(j + 1) % len(new_vkeys)])
-            vkeys.append(new_vkeys[j])
+            vkeys.append(u)
+            vkeys.append(v)
+            vkeys.append(new_vkeys[(i + 1) % len(new_vkeys)])
+            vkeys.append(new_vkeys[i])
 
             new_fkeys.append(self.add_face(vkeys))
 
