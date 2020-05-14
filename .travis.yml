@@ -1,0 +1,37 @@
+language: python
+
+python:
+    - "3.8"
+
+git:
+    depth: false
+
+before_install:
+    - pip install --upgrade pip setuptools wheel
+    - pip install Cython --install-option="--no-cython-compile"
+
+install:
+    - pip install --no-cache-dir -e .[dev]
+    - python -c "from setuptools_scm import get_version;get_version('.', write_to='src/compas_rcf/_version.py')"
+
+script:
+    # - invoke test
+    - echo "Code without tests? Are you sure?"
+    - python setup.py clean --all sdist bdist_wheel
+
+deploy:
+    # - provider: pypi
+      # username: "__token__"
+      # password: $PYPI_TOKEN
+      # distributions: "sdist bdist_wheel"
+      # skip_existing: true
+      # skip_cleanup: true
+      # on:
+          # tags: true
+    - provider: releases
+      skip_cleanup: true
+      api-key: $GITHUB_TOKEN
+      file_glob: true
+      file: dist/*
+      on:
+        tags: true
