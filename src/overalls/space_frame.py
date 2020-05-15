@@ -7,15 +7,41 @@ import Rhino.Geometry as rg
 from compas.datastructures import Mesh
 from compas.datastructures import Network
 from compas.geometry import Point
+from compas.geometry import Scale
+from compas.geometry import Translation
 from compas.geometry import Vector
+from compas.geometry import transform_points
 from compas.utilities import geometric_key
+from compas_ghpython.artists import MeshArtist
 from compas_rhino.geometry import RhinoLine
+from ghpythonlib.treehelpers import list_to_tree
 from overalls.utils import flatten
 from overalls.utils import is_in_domain
 from overalls.utils import to_list
 
 
 class SpaceFrameMixin(object):
+    def get_bbox_origin(self):
+        if hasattr(self, "nodes"):
+            pts = [self.node_coordinates(key) for key in self.nodes()]
+        else:
+            pts = [self.vertex_coordinates(key) for key in self.vertices()]
+
+        rg_pts = [rg.Point3d(*pt) for pt in pts]
+
+        bbox = rg.BoundingBox(rg_pts)
+        return bbox.Corner(True, True, True)
+
+    def get_scale_rgxform(self, factor):
+        scale_origin = self.get_bbox_origin()
+        return rg.Transform.Scale(scale_origin, factor)
+
+    def get_scale_cgxform(self, factor):
+        scale_origin = self.get_bbox_origin()
+        scale_origin = [scale_origin.X, scale_origin.Y, scale_origin.Z]
+
+        return Translation(scale_origin) * Scale([factor] * 3)
+
     def connected_edges(self, key):
         u = key
 
@@ -89,6 +115,16 @@ class SpaceFrameMixin(object):
         for u, v in ekeys:
             lines.append(self.edge_to_rgline(u, v))
 
+        return list_to_tree(lines)
+
+    def to_rglines_meters(self, ekeys=None):
+        # TODO: Bugfix, creates super long lines.
+        raise NotImplementedError("Scaling needs fixing.")
+        T = self.get_scale_rgxform(0.001)
+        lines = self.to_rglines(ekeys=ekeys)
+        for line in lines:
+            line.Transform(T)
+
         return lines
 
 
@@ -103,6 +139,16 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
         self.dist_dict = {}
         self.update_default_edge_attributes(created_from=None)
         self.update_default_node_attributes(created_from=None)
+
+    def transform_network(self, transformation):
+        nodes = [self.node_coordinates(key) for key in self.nodes()]
+        xyz = transform_points(nodes, transformation)
+        for index, (key, attr) in enumerate(self.nodes(True)):
+            attr["x"] = xyz[index][0]
+            attr["y"] = xyz[index][1]
+            attr["z"] = xyz[index][2]
+
+        self.build_dist_dict()
 
     def ensure_dist_dict(self):
         if set(self.nodes()) != set(self.dist_dict.keys()):
@@ -235,8 +281,18 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
                 n_conns += 1
 
     @classmethod
-    def from_space_frame_mesh(cls, mesh):
+    def from_space_frame_mesh(cls, mesh, scale="mm"):
+        # TODO: Bugfix, creates super long lines.
+        if scale != "mm":
+            raise NotImplementedError("Scaling needs fixing.")
+        if scale not in ("m", "mm"):
+            raise Exception("Scale needs to be mm or m.")
+
         network = cls()
+
+        if scale == "m":
+            T = mesh.get_scale_cgxform(1000)
+            mesh.transform(T)
 
         for vkey in mesh.vertices():
             x, y, z = mesh.vertex_coordinates(vkey)
@@ -266,7 +322,11 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
         return nkey
 
     @classmethod
-    def from_rglines(cls, lines, attr_dicts=[]):
+    def from_rglines(cls, lines, scale="mm", attr_dicts=[]):
+        if scale != "mm":
+            raise NotImplementedError("Scaling needs fixing.")
+        if scale not in ("m", "mm"):
+            raise Exception("Scale needs to be mm or m.")
 
         network = cls()
 
@@ -283,6 +343,10 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
 
             network.add_edge(u, v, attr_dict=data)
 
+        if scale == "m":
+            T = network.get_scale_cgxform(1000)
+            network.transform_network(T)
+
         return network
 
 
@@ -296,14 +360,13 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
         self.update_default_edge_attributes(parent_fkey=None, created_from=None)
 
-    """
     def delete_face(self, fkey):
         try:
             super(SpaceFrameMesh, self).delete_face(fkey)
         except KeyError:
             pass
 
-
+    """
     def collapse_edges(self, min_edge_length):
         edges = set(list(self.edges()))
         # print(len(edges))
@@ -330,10 +393,12 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         if max_degree:
             if not self.ok_degree(old_vkeys, max_degree):
+                print("Not ok_subd due to vertex degrees")
                 return False
 
         if min_angle:
             if not self.ok_edges_angles(flatten([old_vkeys + new_vkeys]), min_angle):
+                print("Not ok_subd due to edge angles.")
                 return False
 
         if edge_length_domain:
@@ -341,6 +406,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             ekeys = flatten(ekeys)
             uv_sets = set(frozenset((u, v)) for u, v in ekeys)  # unique edges
             if not self.ok_edge_length(uv_sets, edge_length_domain):
+                print("Not ok_subd due to edge length constraints.")
                 return False
 
         return True
@@ -380,8 +446,9 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         repeating_rel_pos = cycle(to_list(rel_pos)) if rel_pos else None
         repeating_move_z = cycle(to_list(move_z)) if move_z else None
 
-        new_subd_fkeys = []
-        for fkey in fkeys:
+        fkeys = set(fkeys)
+        while len(fkeys) > 0:
+            fkey = fkeys.pop()
             n_iters = next(repeating_n_iters)
             if repeating_rel_pos:
                 kwargs.update({"rel_pos": next(repeating_rel_pos)})
@@ -393,17 +460,18 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 subdiv_parent_face = cycle(to_list(subdiv_parent_face))
 
             i = 0
-            next_to_subd = [fkey]
+            next_to_subd = set([fkey])
             while i < n_iters:
 
                 to_subd = next_to_subd
-                next_to_subd = []
+                next_to_subd = set()
 
                 subdiv_iteration = next(subdiv_parent_face)
                 if not hasattr(subdiv_iteration, "__next__"):
                     subdiv_iteration = cycle(to_list(subdiv_iteration))
 
-                for parent_fkey in to_subd:
+                while len(to_subd) > 0:
+                    parent_fkey = to_subd.pop()
                     parent_face_verts = self.face_vertices(parent_fkey)
                     parent_attrs = self.face_attributes(parent_fkey)
 
@@ -411,22 +479,32 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
                     subdiv_func = subdiv_funcs[subdiv_child_face]
 
-                    new_vkeys, new_fkeys = subdiv_func(parent_fkey, **kwargs)
+                    new_vkeys, new_fkeys, deleted_faces = subdiv_func(
+                        parent_fkey, **kwargs
+                    )
+                    print(deleted_faces)
 
                     if not self.ok_subd(parent_face_verts, new_vkeys, **kwargs):
                         self.undo_face_subd(
-                            new_fkeys, parent_fkey, parent_face_verts, parent_attrs
+                            new_fkeys, new_vkeys, deleted_faces, parent_attrs
                         )
                         continue
 
-                    next_to_subd += new_fkeys
-                    new_subd_fkeys += new_fkeys
+                    deleted_fkeys = set([fkey for fkey, _ in deleted_faces])
+
+                    # add new fkeys to set for next iteration
+                    next_to_subd |= set(new_fkeys)
+                    next_to_subd -= deleted_fkeys
+
+                    # remove deleted faces from input list of fkeys
+                    fkeys -= deleted_fkeys
+
+                    # remove deleted faces from list for this iteration
+                    to_subd -= deleted_fkeys
 
                 i += 1
 
         self.cull_vertices()
-
-        return [fkey for fkey in new_fkeys if self.has_face(fkey)]
 
     def face_subdiv_pyramid(self, fkey, rel_pos=None, move_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
@@ -435,6 +513,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         face_halfedges = self.face_halfedges(fkey)
 
+        deleted_faces = [(fkey, self.face_vertices(fkey))]
         self.delete_face(fkey)
 
         center_vkey = self.add_vertex(x=x, y=y, z=z)
@@ -444,35 +523,58 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             vkeys = [u, v, center_vkey]
             new_fkeys.append(self.add_face(vkeys))
 
-        return [center_vkey], new_fkeys
+        return [center_vkey], new_fkeys, deleted_faces
+
+    def _split_edges(self, fkey, halfedges):
+        new_fkeys = []
+        new_vkeys = []
+        deleted_faces = []
+
+        for u, v in halfedges:
+            adj_faces = [key for key in self.edge_faces(u, v) if key != fkey]
+            adj_face = adj_faces.pop()
+
+            new_vkeys.append(self.split_edge(u, v, allow_boundary=True))
+
+            if adj_face:
+                deleted_faces.append((adj_face, self.face_vertices(adj_face)))
+
+                split_from = new_vkeys[-1]
+                split_to = self.face_vertex_descendant(adj_face, split_from, n=2)
+
+                self.split_face(adj_face, split_from, split_to)
+
+                new_fkeys += self.edge_faces(split_from, split_to)
+                self.delete_face(adj_face)
+
+        return new_vkeys, new_fkeys, deleted_faces
 
     def face_subdiv_mid_cent(self, fkey, rel_pos=None, move_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
         x, y, z = self._move_center_pt(xyz, fkey, rel_pos, move_z)
 
-        face_vertices = self.face_vertices(fkey)
         face_halfedges = self.face_halfedges(fkey)
 
+        new_vkeys, new_fkeys, deleted_faces = self._split_edges(fkey, face_halfedges)
+
+        deleted_faces.append((fkey, self.face_vertices(fkey)))
         self.delete_face(fkey)
 
         center_vkey = self.add_vertex(x=x, y=y, z=z)
 
-        new_vkeys = []
-        for u, v in face_halfedges:
-            x, y, z = self.edge_midpoint(u, v)
-            new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
-
-        new_fkeys = []
-        for i, face_vertex in enumerate(face_vertices):
+        for i, face_halfedge in enumerate(face_halfedges):
+            face_vertex, _ = face_halfedge
             edge_mid = new_vkeys[i]
             prev_edge_mid = new_vkeys[(i - 1) % len(new_vkeys)]
+
             vkeys = [face_vertex, edge_mid, center_vkey, prev_edge_mid]
+            print(vkeys)
             new_fkeys.append(self.add_face(vkeys))
 
         new_vkeys.append(center_vkey)
 
-        return new_vkeys, new_fkeys
+        return new_vkeys, new_fkeys, deleted_faces
 
     def face_subdiv_mids(self, fkey, **kwattr):
         # remove rel_pos and rel_pos_z since they don't apply
@@ -480,17 +582,14 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         kwattr.pop("rel_pos_z", None)
 
         face_halfedges = self.face_halfedges(fkey)
-        face_vertices = self.face_vertices(fkey)
 
+        new_vkeys, new_fkeys, deleted_faces = self._split_edges(fkey, face_halfedges)
+
+        deleted_faces.append((fkey, self.face_vertices(fkey)))
         self.delete_face(fkey)
 
-        new_vkeys = []
-        for u, v in face_halfedges:
-            x, y, z = self.edge_midpoint(u, v)
-            new_vkeys.append(self.add_vertex(x=x, y=y, z=z))
-
-        new_fkeys = []
-        for i, face_vertex in enumerate(face_vertices):
+        for i, halfedges in enumerate(face_halfedges):
+            face_vertex, _ = halfedges
             prev_edge_mid = new_vkeys[(i - 1) % len(new_vkeys)]
             edge_mid = new_vkeys[i]
             vkeys = [prev_edge_mid, face_vertex, edge_mid]
@@ -499,7 +598,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         # middle face
         new_fkeys.append(self.add_face(new_vkeys))
 
-        return new_vkeys, new_fkeys
+        return new_vkeys, new_fkeys, deleted_faces
 
     def face_subdiv_split(
         self, fkey, tri_split_equal=True, shift_split=False, **kwattr
@@ -508,19 +607,17 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
 
-        face_vertices = self.face_vertices(fkey)
         face_halfedges = self.face_halfedges(fkey)
         # print("fkeys: {}, halfedges: {}".format(face_vertices, face_halfedges))
-        self.delete_face(fkey)
 
         u1, v1 = face_halfedges[0 + shift_split]
-        x, y, z = self.edge_midpoint(u1, v1)
 
-        e_mid1 = self.add_vertex(x=x, y=y, z=z)
+        new_vkeys, new_fkeys, deleted_faces = self._split_edges(fkey, [(u1, v1)])
+        deleted_faces.append((fkey, self.face_vertices(fkey)))
 
-        new_vkeys = [e_mid1]
-        new_fkeys = []
-        if len(face_vertices) == 3:
+        e_mid1 = new_vkeys[-1]
+
+        if len(face_halfedges) == 3:
             u2, v2 = face_halfedges[1 + shift_split]
             if tri_split_equal:
                 # tri split in half
@@ -530,13 +627,17 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             else:
                 # tri face split into one quad and one tri
 
-                x, y, z = self.edge_midpoint(u2, v2)
-                e_mid2 = self.add_vertex(x=x, y=y, z=z, attr_dicts=kwattr)
+                _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(
+                    fkey, [(u2, v2)]
+                )
+                new_vkeys += _new_vkeys
+                new_fkeys += _new_fkeys
+                deleted_faces += _deleted_faces
+
+                e_mid2 = new_vkeys[-1]
 
                 new_face_verts1 = [u1, e_mid1, e_mid2, v2]
                 new_face_verts2 = [e_mid1, u2, e_mid2]
-
-                new_vkeys.append(e_mid2)
 
         else:
             # Quad face into two smaller quad faces
@@ -544,18 +645,22 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             # Get edge opposite (u1, v1)
             u2, v2 = face_halfedges[2 + shift_split]
 
-            x, y, z = self.edge_midpoint(u2, v2)
-            e_mid2 = self.add_vertex(x=x, y=y, z=z)
+            _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(fkey, [(u2, v2)])
+            new_vkeys += _new_vkeys
+            new_fkeys += _new_fkeys
+            deleted_faces += _deleted_faces
+
+            e_mid2 = new_vkeys[-1]
 
             new_face_verts1 = [u1, e_mid1, e_mid2, v2]
             new_face_verts2 = [e_mid1, v1, u2, e_mid2]
 
-            new_vkeys.append(e_mid2)
+        self.delete_face(fkey)
 
         new_fkeys.append(self.add_face(new_face_verts1))
         new_fkeys.append(self.add_face(new_face_verts2))
 
-        return new_vkeys, new_fkeys
+        return new_vkeys, new_fkeys, deleted_faces
 
     def face_subdiv_frame(self, fkey, rel_pos=None, move_z=None, **kwattr):
         if rel_pos == 1 or rel_pos == [1, 1, 1]:
@@ -566,6 +671,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         face_coordinates = self.face_coordinates(fkey)
         face_halfedges = self.face_halfedges(fkey)
 
+        deleted_faces = [(fkey, self.face_vertices(fkey))]
         self.delete_face(fkey)
 
         if move_z is None:
@@ -606,10 +712,26 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         # add new center face
         new_fkeys.append(self.add_face(new_vkeys))
 
-        return new_vkeys, new_fkeys
+        return new_vkeys, new_fkeys, deleted_faces
 
-    def undo_face_subd(self, new_fkeys, old_fkey, old_face_verts, old_attrs):
+    def undo_face_subd(self, new_fkeys, new_vkeys, deleted_faces):
         for fkey in new_fkeys:
             self.delete_face(fkey)
 
-        self.add_face(old_face_verts, fkey=old_fkey, attr_dict=old_attrs)
+        for vkey in new_vkeys:
+            self.delete_vertex(vkey)
+
+        for fkey, face_vertices in deleted_faces:
+            self.add_face(face_vertices, fkey=fkey)
+
+    def to_rgmesh(self):
+        artist = MeshArtist(self)
+        return artist.draw_mesh()
+
+    def to_rgmesh_meters(self):
+        raise NotImplementedError("Scaling needs fixing.")
+        rg_mesh = self.to_rgmesh()
+        T = self.get_scale_rgxform(0.001)
+        rg_mesh.Transform(T)
+
+        return rg_mesh
