@@ -12,7 +12,7 @@ before_install:
 
 install:
     - pip install --no-cache-dir -e .[dev]
-    - python -c "from setuptools_scm import get_version;get_version('.', write_to='src/compas_rcf/_version.py')"
+    - python -c "from setuptools_scm import get_version;get_version('.', write_to='src/overalls/_version.py')"
 
 script:
     # - invoke test
