@@ -473,7 +473,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 while len(to_subd) > 0:
                     parent_fkey = to_subd.pop()
                     parent_face_verts = self.face_vertices(parent_fkey)
-                    parent_attrs = self.face_attributes(parent_fkey)
+                    # parent_attrs = self.face_attributes(parent_fkey)
 
                     subdiv_child_face = next(subdiv_iteration)
 
@@ -482,11 +482,10 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                     new_vkeys, new_fkeys, deleted_faces = subdiv_func(
                         parent_fkey, **kwargs
                     )
-                    print(deleted_faces)
 
                     if not self.ok_subd(parent_face_verts, new_vkeys, **kwargs):
                         self.undo_face_subd(
-                            new_fkeys, new_vkeys, deleted_faces, parent_attrs
+                            new_fkeys, new_vkeys, deleted_faces,
                         )
                         continue
 
@@ -533,11 +532,12 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         for u, v in halfedges:
             adj_faces = [key for key in self.edge_faces(u, v) if key != fkey]
             adj_face = adj_faces.pop()
+            adj_face_verts = self.face_vertices(adj_face) if adj_face else None
 
             new_vkeys.append(self.split_edge(u, v, allow_boundary=True))
 
             if adj_face:
-                deleted_faces.append((adj_face, self.face_vertices(adj_face)))
+                deleted_faces.append((adj_face, adj_face_verts))
 
                 split_from = new_vkeys[-1]
                 split_to = self.face_vertex_descendant(adj_face, split_from, n=2)
@@ -569,7 +569,6 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             prev_edge_mid = new_vkeys[(i - 1) % len(new_vkeys)]
 
             vkeys = [face_vertex, edge_mid, center_vkey, prev_edge_mid]
-            print(vkeys)
             new_fkeys.append(self.add_face(vkeys))
 
         new_vkeys.append(center_vkey)
@@ -715,6 +714,14 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         return new_vkeys, new_fkeys, deleted_faces
 
     def undo_face_subd(self, new_fkeys, new_vkeys, deleted_faces):
+        # TODO: Figure out how a new vkey can also be part of deleted face
+        deleted_fkeys, deleted_face_verts = zip(*deleted_faces)
+        dups_removed = []
+        for face_verts in deleted_face_verts:
+            face_verts = [key for key in face_verts if key not in new_vkeys]
+            dups_removed.append(face_verts)
+        deleted_faces = zip(deleted_fkeys, dups_removed)
+
         for fkey in new_fkeys:
             self.delete_face(fkey)
 
@@ -722,7 +729,17 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             self.delete_vertex(vkey)
 
         for fkey, face_vertices in deleted_faces:
-            self.add_face(face_vertices, fkey=fkey)
+            try:
+                self.add_face(face_vertices, fkey=fkey)
+            except KeyError:
+                print(fkey, face_vertices)
+                print(
+                    "Face key already present: {}. Vertex exists in mesh: {}".format(
+                        self.has_face(fkey),
+                        [self.has_vertex(key) for key in face_vertices],
+                    )
+                )
+                raise
 
     def to_rgmesh(self):
         artist = MeshArtist(self)
