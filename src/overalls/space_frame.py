@@ -54,6 +54,9 @@ class SpaceFrameMixin(object):
             yield (u, v)
 
     def ok_degree(self, keys, max_degree):
+        if not max_degree:
+            return True
+
         if isinstance(self, Network):
             degree_func = self.degree
         else:
@@ -73,32 +76,45 @@ class SpaceFrameMixin(object):
         return True
 
     def ok_edge_angles(self, key, min_angle, additional_edge=None):
-        edges = list(self.connected_edges(key))
+        if not min_angle:
+            return True
+        smallest_edge_angle = self.vertex_smallest_edge_angle(
+            key, additional_edge=additional_edge
+        )
+        return smallest_edge_angle > min_angle
+
+    def vertex_smallest_edge_angle(self, vkey, additional_edge=None):
+        edges = list(self.connected_edges(vkey))
 
         if additional_edge:
             edges.append(additional_edge)
 
         vectors = []
         for u, v in edges:
-            if u != key:
+            if u != vkey:
                 u, v = v, u
             vec = rg.Vector3d(*self.edge_vector(u, v))
             vec.Unitize()
             vectors.append(vec)
 
         to_compare = combinations(range(len(vectors)), 2)
+        vector_angles = []
         for v, v1 in list(to_compare):
             v, v1 = vectors[v], vectors[v1]
-            if rg.Vector3d.VectorAngle(v, v1) < min_angle:
-                return False
+            vector_angles.append(rg.Vector3d.VectorAngle(v, v1))
 
-        return True
+        return min(vector_angles)
 
-    def ok_edge_length(self, ekeys, length_domain):
+    def ok_edge_lengths(self, ekeys, length_domain):
         for u, v in ekeys:
-            if not is_in_domain(self.edge_length(u, v), length_domain):
+            if not self.ok_edge_length(u, v, length_domain):
                 return False
         return True
+
+    def ok_edge_length(self, u, v, length_domain):
+        if not length_domain:
+            return True
+        return is_in_domain(self.edge_length(u, v), length_domain)
 
     def edge_to_rgline(self, u, v):
         pt_a, pt_b = self.edge_coordinates(u, v)
@@ -380,6 +396,46 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 self.collapse_edge(u, v, t=t)
         """
 
+    def analyse_mesh(self, max_degree, min_angle, edge_length_domain):
+        wrong_degree = []
+        wrong_angle = []
+        wrong_edge_length = []
+
+        for vkey in self.vertices():
+            if not self.ok_degree(vkey, max_degree):
+                wrong_degree.append(vkey)
+            if not self.ok_edge_angles(vkey, min_angle):
+                wrong_angle.append(vkey)
+
+        for u, v in self.edges():
+            if not self.ok_edge_length(u, v, edge_length_domain):
+                wrong_edge_length.append((u, v))
+
+        return wrong_degree, wrong_angle, wrong_edge_length
+
+    def analyse_mesh_rg(self, max_degree, min_angle, edge_length_domain):
+        wrong_degree, wrong_angle, wrong_edge_length = self.analyse_mesh(
+            max_degree, min_angle, edge_length_domain
+        )
+
+        wrong_degree_pt = []
+        wrong_angle_pt = []
+        wrong_edge_length_line = []
+
+        for vkey in wrong_degree:
+            x, y, z = self.vertex_coordinates(vkey)
+            wrong_degree_pt.append(rg.Point3d(x, y, z))
+
+        for vkey in wrong_angle:
+            x, y, z = self.vertex_coordinates(vkey)
+            wrong_angle_pt.append(rg.Point3d(x, y, z))
+
+        for u, v in wrong_edge_length:
+            line = self.edge_to_rgline(u, v)
+            wrong_edge_length_line.append(line)
+
+        return wrong_degree_pt, wrong_angle_pt, wrong_edge_length_line
+
     def ok_subd(
         self,
         old_vkeys,
@@ -405,7 +461,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             ekeys = [self.connected_edges(vkey) for vkey in new_vkeys]
             ekeys = flatten(ekeys)
             uv_sets = set(frozenset((u, v)) for u, v in ekeys)  # unique edges
-            if not self.ok_edge_length(uv_sets, edge_length_domain):
+            if not self.ok_edge_lengths(uv_sets, edge_length_domain):
                 print("Not ok_subd due to edge length constraints.")
                 return False
 
