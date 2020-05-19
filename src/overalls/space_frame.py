@@ -18,6 +18,7 @@ from ghpythonlib.treehelpers import list_to_tree
 from overalls.utils import flatten
 from overalls.utils import is_in_domain
 from overalls.utils import to_list
+from System.Collections.Generic import KeyNotFoundException
 
 
 class SpaceFrameMixin(object):
@@ -104,6 +105,24 @@ class SpaceFrameMixin(object):
             vector_angles.append(rg.Vector3d.VectorAngle(v, v1))
 
         return min(vector_angles)
+
+    def edge_length_ratios(self, fkey):
+        edges = self.face_halfedges(fkey)
+        edge_lengths = []
+
+        for u, v in edges:
+            edge_lengths.append([(u, v), self.edge_length(u, v)])
+
+        edge_lengths.sort(key=lambda x: x[1])
+        _, ref_length = edge_lengths[0]
+
+        return [(ekey, length / ref_length) for ekey, length in edge_lengths]
+
+    def ok_edge_length_ratios(self, fkey, max_ratio_diff):
+        edge_length_ratios = self.edge_length_ratios(fkey)
+        _, longest_edge_ratio = edge_length_ratios[-1]
+
+        return longest_edge_ratio <= max_ratio_diff
 
     def ok_edge_lengths(self, ekeys, length_domain):
         for u, v in ekeys:
@@ -372,9 +391,13 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
     def __init__(self):
         super(SpaceFrameMesh, self).__init__()
-        self.update_default_face_attributes(parent_fkey=None, created_from=None)
+        self.update_default_face_attributes(
+            parent_fkey=None, created_from=None, n_iters=0
+        )
         self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
-        self.update_default_edge_attributes(parent_fkey=None, created_from=None)
+        self.update_default_edge_attributes(
+            parent_fkey=None, created_from=None, structural_data=None
+        )
 
     def delete_face(self, fkey):
         try:
@@ -396,9 +419,12 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 self.collapse_edge(u, v, t=t)
         """
 
-    def analyse_mesh(self, max_degree, min_angle, edge_length_domain):
+    def analyse_mesh(
+        self, max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
+    ):
         wrong_degree = []
         wrong_angle = []
+        wrong_ratio = []
         wrong_edge_length = []
 
         for vkey in self.vertices():
@@ -407,19 +433,26 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             if not self.ok_edge_angles(vkey, min_angle):
                 wrong_angle.append(vkey)
 
+        for fkey in self.faces():
+            if not self.ok_edge_length_ratios(fkey, max_edge_ratio_diff):
+                wrong_ratio.append(fkey)
+
         for u, v in self.edges():
             if not self.ok_edge_length(u, v, edge_length_domain):
                 wrong_edge_length.append((u, v))
 
-        return wrong_degree, wrong_angle, wrong_edge_length
+        return wrong_degree, wrong_angle, wrong_ratio, wrong_edge_length
 
-    def analyse_mesh_rg(self, max_degree, min_angle, edge_length_domain):
-        wrong_degree, wrong_angle, wrong_edge_length = self.analyse_mesh(
-            max_degree, min_angle, edge_length_domain
+    def analyse_mesh_rg(
+        self, max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
+    ):
+        wrong_degree, wrong_angle, wrong_ratio, wrong_edge_length = self.analyse_mesh(
+            max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
         )
 
         wrong_degree_pt = []
         wrong_angle_pt = []
+        wrong_ratio_line = []
         wrong_edge_length_line = []
 
         for vkey in wrong_degree:
@@ -430,19 +463,32 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             x, y, z = self.vertex_coordinates(vkey)
             wrong_angle_pt.append(rg.Point3d(x, y, z))
 
+        for fkey in wrong_ratio:
+            face_mesh = Mesh()
+            new_fkeys = []
+            for x, y, z in self.face_coordinates(fkey):
+                new_fkeys.append(face_mesh.add_vertex(x=x, y=y, z=z))
+            face_mesh.add_face(new_fkeys)
+
+            artist = MeshArtist(face_mesh)
+
+            wrong_ratio_line.append(artist.draw_mesh())
+
         for u, v in wrong_edge_length:
             line = self.edge_to_rgline(u, v)
             wrong_edge_length_line.append(line)
 
-        return wrong_degree_pt, wrong_angle_pt, wrong_edge_length_line
+        return wrong_degree_pt, wrong_angle_pt, wrong_ratio_line, wrong_edge_length_line
 
     def ok_subd(
         self,
         old_vkeys,
         new_vkeys,
+        new_fkeys,
         max_degree=None,
         min_angle=None,
         edge_length_domain=None,
+        max_edge_ratio_diff=None,
         **kwargs
     ):
         new_vkeys = to_list(new_vkeys)
@@ -464,6 +510,11 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             if not self.ok_edge_lengths(uv_sets, edge_length_domain):
                 print("Not ok_subd due to edge length constraints.")
                 return False
+
+        if max_edge_ratio_diff:
+            for fkey in new_fkeys:
+                if not self.ok_edge_length_ratios(fkey, max_edge_ratio_diff):
+                    return False
 
         return True
 
@@ -487,8 +538,22 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return pt
 
+    @staticmethod
+    def _get_next_cycle(var):
+        var = next(var)
+        if not hasattr(var, "__next__"):
+            return cycle(to_list(var))
+        return var
+
     def subdiv_faces(
-        self, fkeys, n_iters, scheme=[0], rel_pos=None, move_z=None, **kwargs
+        self,
+        fkeys,
+        n_iters=None,
+        scheme=[0],
+        rel_pos=None,
+        move_z=None,
+        max_iters=None,
+        **kwargs
     ):
         subdiv_funcs = [
             self.face_subdiv_pyramid,
@@ -497,7 +562,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             self.face_subdiv_split,
             self.face_subdiv_frame,
         ]
-        repeating_n_iters = cycle(n_iters)
+        repeating_n_iters = cycle(n_iters) if n_iters else None
         subdiv_cycler = cycle(scheme)
         repeating_rel_pos = cycle(to_list(rel_pos)) if rel_pos else None
         repeating_move_z = cycle(to_list(move_z)) if move_z else None
@@ -505,15 +570,21 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         fkeys = set(fkeys)
         while len(fkeys) > 0:
             fkey = fkeys.pop()
-            n_iters = next(repeating_n_iters)
+
+            if n_iters:
+                n_iters = next(repeating_n_iters)
+            else:
+                n_iters = self.face_attribute(fkey, "n_iters")
+
+            if max_iters:
+                n_iters = n_iters if n_iters < max_iters else max_iters
+
             if repeating_rel_pos:
                 kwargs.update({"rel_pos": next(repeating_rel_pos)})
             if repeating_move_z:
                 kwargs.update({"move_z": next(repeating_move_z)})
 
-            subdiv_parent_face = next(subdiv_cycler)
-            if not hasattr(subdiv_parent_face, "__next__"):
-                subdiv_parent_face = cycle(to_list(subdiv_parent_face))
+            subdiv_func_per_parent_face = self._get_next_cycle(subdiv_cycler)
 
             i = 0
             next_to_subd = set([fkey])
@@ -522,16 +593,14 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 to_subd = next_to_subd
                 next_to_subd = set()
 
-                subdiv_iteration = next(subdiv_parent_face)
-                if not hasattr(subdiv_iteration, "__next__"):
-                    subdiv_iteration = cycle(to_list(subdiv_iteration))
+                subd_func_per_iter = self._get_next_cycle(subdiv_func_per_parent_face)
 
                 while len(to_subd) > 0:
                     parent_fkey = to_subd.pop()
                     parent_face_verts = self.face_vertices(parent_fkey)
                     # parent_attrs = self.face_attributes(parent_fkey)
 
-                    subdiv_child_face = next(subdiv_iteration)
+                    subdiv_child_face = next(subd_func_per_iter)
 
                     subdiv_func = subdiv_funcs[subdiv_child_face]
 
@@ -539,7 +608,9 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                         parent_fkey, **kwargs
                     )
 
-                    if not self.ok_subd(parent_face_verts, new_vkeys, **kwargs):
+                    if not self.ok_subd(
+                        parent_face_verts, new_vkeys, new_fkeys, **kwargs
+                    ):
                         self.undo_face_subd(
                             new_fkeys, new_vkeys, deleted_faces,
                         )
@@ -655,6 +726,15 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return new_vkeys, new_fkeys, deleted_faces
 
+    """
+    def vertex_subdiv_split(self, vkey):
+        nbrs = self.vertex_neighbors(vkey)
+
+
+        edges = self.connected_edges(vkey)
+        edges.sort(key=lambda u, v: self.edge_length(u, v))
+    """
+
     def face_subdiv_split(
         self, fkey, tri_split_equal=True, shift_split=False, **kwattr
     ):
@@ -718,6 +798,26 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         return new_vkeys, new_fkeys, deleted_faces
 
     def face_subdiv_frame(self, fkey, rel_pos=None, move_z=None, **kwattr):
+        """Subdivide a face by offsetting its edges inwards
+
+        Creates ``verts+1`` new faces.
+
+        Parameters
+        ----------
+        fkey : :obj:`int`
+        rel_pos: :obj:`list` of :obj:`float`
+        rel_pos: :obj:`float`
+
+        Returns
+        -------
+        :obj:`list` of :obj:`int`
+            Keys of newly created vertices.
+        :obj:`list` of :obj:`int`
+            Keys of newly created faces.
+        :obj:`tuple` of :obj:`int` and :obj:`tuple` of :obj:`int`
+            Face keys of removed faces and their vertex keys.
+        """
+
         if rel_pos == 1 or rel_pos == [1, 1, 1]:
             return self.face_subdiv_pyramid(fkey, move_z=move_z, **kwattr)
 
@@ -770,6 +870,23 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         return new_vkeys, new_fkeys, deleted_faces
 
     def undo_face_subd(self, new_fkeys, new_vkeys, deleted_faces):
+        """Reverse a face subdivision.
+
+        Parameters
+        ----------
+        new_fkeys : :obj:`list` of :obj:`int`
+            Keys of faces created in last subdivision.
+        new_vkeys : :obj:`list` of :obj:`int`
+            Keys of vertices created in last subdivision.
+        deleted_faces : :obj:`list` of :obj:`tuple`
+            Keys of faces that were removed in last subdivision and their
+            vertex key. E.g. ``(fkey, (vkey1, vkey2, vkey3))``.
+
+        Raises
+        ------
+        :exc:`KeyError`
+            If vertex key from deleted_faces is not found in mesh.
+        """
         # TODO: Figure out how a new vkey can also be part of deleted face
         deleted_fkeys, deleted_face_verts = zip(*deleted_faces)
         dups_removed = []
@@ -797,7 +914,82 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 )
                 raise
 
+    def correlate_lines(self, lines, data, label="structural_data"):
+        """Correlate lines to mesh edges and add attributes to correlated edges.
+
+        Parameters
+        ----------
+        lines : :obj:`list` of :class:`Rhino.Geometry.Line`
+            Rhino lines to correlate to mesh edges.
+        data : :obj:`list`
+            Data to add to edge attributes.
+        label : :obj:`str`, optional
+            Label for edge-data (key in `attr_dict`)
+        """
+        vertex_dict = {}
+        for vkey in self.vertices():
+            xyz = geometric_key(self.vertex_coordinates(vkey), precision="d")
+
+            vertex_dict[xyz] = vkey
+
+        for line, line_data in zip(lines, data):
+            start_xyz = geometric_key(
+                [line.FromX, line.FromY, line.FromZ], precision="d"
+            )
+
+            end_xyz = geometric_key([line.ToX, line.ToY, line.ToZ], precision="d")
+
+            start_vertex = vertex_dict.get(start_xyz)
+            end_vertex = vertex_dict.get(end_xyz)
+
+            try:
+                self.edge_attribute((start_vertex, end_vertex), label, line_data)
+                print(self.edge_attribute((start_vertex, end_vertex), label))
+            except KeyNotFoundException:
+                exists = self.has_edge((start_vertex, end_vertex))
+                reverse_exists = self.has_edge((end_vertex, start_vertex))
+                print(
+                    "Edge: {}-{}. Exists: {}. Reverse exists: {}".format(
+                        start_vertex, end_vertex, exists, reverse_exists
+                    )
+                )
+
+    def n_iters_from_edge_data(
+        self, face_label="n_iters", edge_label="structural_data"
+    ):
+        self.update_default_edge_attributes({edge_label: None})
+        self.update_default_face_attributes({face_label: 0})
+        for u, v in self.edges():
+            data = self.edge_attribute((u, v), edge_label)
+            if not data:
+                continue
+
+            adj_fkeys = self.edge_faces(u, v)
+            adj_fkeys = [x for x in adj_fkeys if x]
+
+            if len(adj_fkeys) < 2:
+                fkey = adj_fkeys.pop()
+                face_data = self.face_attribute(fkey, face_label)
+                face_data += data
+                self.face_attribute(fkey, face_label, face_data)
+            else:
+                fkey_a, fkey_b = adj_fkeys
+                face_data_a = self.face_attribute(fkey_a, face_label)
+                face_data_b = self.face_attribute(fkey_b, face_label)
+
+                face_data_a += int(data // 2)
+                face_data_b += int(data // 2 + data % 2)
+
+                self.face_attribute(fkey_a, face_label, face_data_a)
+                self.face_attribute(fkey_b, face_label, face_data_b)
+
     def to_rgmesh(self):
+        """Convert to :class:`Rhino.Geometry.Mesh`
+
+        Returns
+        -------
+        :class:`Rhino.Geometry.Mesh`
+        """
         artist = MeshArtist(self)
         return artist.draw_mesh()
 
