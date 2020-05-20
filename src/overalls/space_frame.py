@@ -747,12 +747,17 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         edges.sort(key=lambda u, v: self.edge_length(u, v))
     """
 
-    def face_subdiv_split(
-        self, fkey, tri_split_equal=True, shift_split=False, **kwattr
-    ):
+    def face_subdiv_split(self, fkey, split_even=True, shift_split=False, **kwattr):
         # remove rel_pos and rel_pos_z since they don't apply
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
+        tri_split_equal = kwattr.pop("tri_split_equal", None)
+
+        if tri_split_equal:
+            raise DeprecationWarning(
+                "Changed the name of this keyword argument to split_even."
+            )
+            split_even = tri_split_equal
 
         face_halfedges = self.face_halfedges(fkey)
         # print("fkeys: {}, halfedges: {}".format(face_vertices, face_halfedges))
@@ -766,7 +771,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         if len(face_halfedges) == 3:
             u2, v2 = face_halfedges[1 + shift_split]
-            if tri_split_equal:
+            if split_even:
                 # tri split in half
 
                 new_face_verts1 = [u1, e_mid1, v2]
@@ -787,6 +792,8 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 new_face_verts2 = [e_mid1, u2, e_mid2]
 
         else:
+            if split_even:
+                raise NotImplementedError()
             # Quad face into two smaller quad faces
 
             # Get edge opposite (u1, v1)
@@ -808,6 +815,50 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         new_fkeys.append(self.add_face(new_face_verts2))
 
         return new_vkeys, new_fkeys, deleted_faces
+
+    def edge_split_subd(self, u, v, to_trifaces=True):
+        """Split a edge and adjacent faces.
+
+        Parameters
+        ----------
+        u, v
+            Edge key
+        to_trifaces : :obj:`bool`, optional
+            If subdivision should continue until all resulting faces are
+            triangular.
+
+        Returns
+        -------
+        :obj:`list` of :obj:`int`
+            Identifier for the new vertex.
+        :obj:`list` of :obj:`int`
+            Identifiers for new faces
+        :obj:`list`
+            Placeholder for `deleted_faces`
+        """
+        fkeys = self.edge_faces(u, v)
+
+        new_vkey = self.split_edge(u, v)
+        new_fkeys = []
+
+        for fkey in fkeys:
+            split_from = new_vkey
+            split_to = self.face_vertex_descendant(fkey, split_from, n=2)
+
+            new_fkeys += self.split_face(fkey, split_from, split_to)
+
+            if to_trifaces:
+                for fkey in new_fkeys[-2:]:
+                    split_from = new_vkey
+                    split_to = self.face_vertex_descendant(fkey, split_from, n=2)
+
+                    try:
+                        new_fkeys += self.split_face(fkey, split_from, split_to)
+                    except ValueError:  # face is already triface
+                        pass
+
+        # Imitating the return values of face subds
+        return [new_vkey], new_fkeys, []
 
     def face_subdiv_frame(self, fkey, rel_pos=None, move_z=None, **kwattr):
         """Subdivide a face by offsetting its edges inwards
