@@ -1,4 +1,5 @@
 import math
+from collections import Sequence
 from copy import copy
 from itertools import combinations
 from itertools import cycle
@@ -119,6 +120,9 @@ class SpaceFrameMixin(object):
         return [(ekey, length / ref_length) for ekey, length in edge_lengths]
 
     def ok_edge_length_ratios(self, fkey, max_ratio_diff):
+        if not max_ratio_diff:
+            return True
+
         edge_length_ratios = self.edge_length_ratios(fkey)
         _, longest_edge_ratio = edge_length_ratios[-1]
 
@@ -172,8 +176,10 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
     def __init__(self):
         super(SpaceFrameNetwork, self).__init__()
         self.dist_dict = {}
-        self.update_default_edge_attributes(created_from=None)
-        self.update_default_node_attributes(created_from=None)
+        self.update_default_edge_attributes(
+            created_from=None, part_id=None, structural_data=None
+        )
+        self.update_default_node_attributes(created_from=None, part_id=None)
 
     def transform_network(self, transformation):
         nodes = [self.node_coordinates(key) for key in self.nodes()]
@@ -306,7 +312,8 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
                     break
 
             # max_degree-1 because we will add one
-            if self.ok_conn(u, v, max_degree - 1, min_angle):
+            ok_degree = max_degree - 1 if max_degree else None
+            if self.ok_conn(u, v, ok_degree, min_angle):
                 self.add_edge(
                     u,
                     v,
@@ -330,15 +337,14 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
             mesh.transform(T)
 
         for vkey in mesh.vertices():
-            x, y, z = mesh.vertex_coordinates(vkey)
-            # data = mesh.vertex_attributes(vkey)
-            # data.update({"created_from": cls.FROM_MESH})
-            network.add_node(key=vkey, x=x, y=y, z=z)
+            data = mesh.vertex_attributes(vkey)
+            data.update({"created_from": cls.FROM_MESH})
+            network.add_node(key=vkey, **data)
 
         for u, v in mesh.edges():
             # data = mesh.edge_attributes((u, v))
-            # data.update({"created_from": cls.FROM_MESH})
-            network.add_edge(u, v)
+            data = {"created_from": cls.FROM_MESH}
+            network.add_edge(u, v, **data)
 
         return network
 
@@ -392,11 +398,13 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
     def __init__(self):
         super(SpaceFrameMesh, self).__init__()
         self.update_default_face_attributes(
-            parent_fkey=None, created_from=None, n_iters=0
+            parent_fkey=None, created_from=None, n_iters=0, part_id=None
         )
-        self.update_default_vertex_attributes(parent_fkey=None, created_from=None)
+        self.update_default_vertex_attributes(
+            parent_fkey=None, created_from=None, part_id=None
+        )
         self.update_default_edge_attributes(
-            parent_fkey=None, created_from=None, structural_data=None
+            parent_fkey=None, created_from=None, structural_data=None, part_id=None
         )
 
     def delete_face(self, fkey):
@@ -541,9 +549,11 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
     @staticmethod
     def _get_next_cycle(var):
         var = next(var)
-        if not hasattr(var, "__next__"):
-            return cycle(to_list(var))
-        return var
+        if hasattr(var, "__next__"):
+            return var
+        if not isinstance(var, Sequence):
+            var = to_list(var)
+        return cycle(var)
 
     def subdiv_faces(
         self,
@@ -593,20 +603,22 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 to_subd = next_to_subd
                 next_to_subd = set()
 
-                subd_func_per_iter = self._get_next_cycle(subdiv_func_per_parent_face)
-
                 while len(to_subd) > 0:
                     parent_fkey = to_subd.pop()
                     parent_face_verts = self.face_vertices(parent_fkey)
+                    part = self.face_attribute(parent_fkey, "part")
                     # parent_attrs = self.face_attributes(parent_fkey)
 
-                    subdiv_child_face = next(subd_func_per_iter)
+                    subd_func_idx = next(subdiv_func_per_parent_face)
 
-                    subdiv_func = subdiv_funcs[subdiv_child_face]
+                    subdiv_func = subdiv_funcs[subd_func_idx]
 
                     new_vkeys, new_fkeys, deleted_faces = subdiv_func(
                         parent_fkey, **kwargs
                     )
+
+                    for vkey in new_vkeys:
+                        self.vertex_attribute(vkey, "part", part)
 
                     if not self.ok_subd(
                         parent_face_verts, new_vkeys, new_fkeys, **kwargs
