@@ -3,6 +3,7 @@ from collections import Sequence
 from copy import copy
 from itertools import combinations
 from itertools import cycle
+from itertools import ifilter
 
 import Rhino.Geometry as rg
 from compas.datastructures import Mesh
@@ -838,7 +839,10 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         """
         fkeys = self.edge_faces(u, v)
 
-        new_vkey = self.split_edge(u, v)
+        # remove None values
+        fkeys = list(ifilter(None, fkeys))
+
+        new_vkey = self.split_edge(u, v, allow_boundary=True)
         new_fkeys = []
 
         for fkey in fkeys:
@@ -858,7 +862,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                         pass
 
         # Imitating the return values of face subds
-        return [new_vkey], new_fkeys, []
+        return [new_vkey], list(ifilter(None, new_fkeys)), []
 
     def face_subdiv_frame(self, fkey, rel_pos=None, move_z=None, **kwattr):
         """Subdivide a face by offsetting its edges inwards
