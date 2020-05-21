@@ -14,6 +14,7 @@ from compas.geometry import Translation
 from compas.geometry import Vector
 from compas.geometry import transform_points
 from compas.utilities import geometric_key
+from compas.utilities import pairwise
 from compas_ghpython.artists import MeshArtist
 from compas_rhino.geometry import RhinoLine
 from ghpythonlib.treehelpers import list_to_tree
@@ -140,6 +141,34 @@ class SpaceFrameMixin(object):
             return True
         return is_in_domain(self.edge_length(u, v), length_domain)
 
+    def analyse(
+        self,
+        max_degree=None,
+        min_angle=None,
+        max_edge_ratio_diff=None,
+        edge_length_domain=None,
+    ):
+        wrong_degree = []
+        wrong_angle = []
+        wrong_ratio = []
+        wrong_edge_length = []
+
+        for vkey in self.vertices():
+            if not self.ok_degree(vkey, max_degree):
+                wrong_degree.append(vkey)
+            if not self.ok_edge_angles(vkey, min_angle):
+                wrong_angle.append(vkey)
+
+        for fkey in self.faces():
+            if not self.ok_edge_length_ratios(fkey, max_edge_ratio_diff):
+                wrong_ratio.append(fkey)
+
+        for u, v in self.edges():
+            if not self.ok_edge_length(u, v, edge_length_domain):
+                wrong_edge_length.append((u, v))
+
+        return wrong_degree, wrong_angle, wrong_ratio, wrong_edge_length
+
     def edge_to_rgline(self, u, v):
         pt_a, pt_b = self.edge_coordinates(u, v)
         pt_a = rg.Point3d(*pt_a)
@@ -265,6 +294,109 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
         # print("{}-{} passed ok_conn".format(u, v))
         return True
 
+    def analyse(self, max_degree=None, min_angle=None, edge_length_domain=None):
+        wrong_degree = []
+        wrong_angle = []
+        wrong_edge_length = []
+
+        for key in self.nodes():
+            if not self.ok_degree(key, max_degree):
+                wrong_degree.append(key)
+            if not self.ok_edge_angles(key, min_angle):
+                wrong_angle.append(key)
+
+        for u, v in self.edges():
+            if not self.ok_edge_length(u, v, edge_length_domain):
+                wrong_edge_length.append((u, v))
+
+        return wrong_degree, wrong_angle, wrong_edge_length
+
+    def analyse_rg(
+        self,
+        show_only_bad=False,
+        max_degree=None,
+        min_angle=None,
+        edge_length_domain=None,
+    ):
+        """Returns Rhino.Geometry objects to visualize component properties.
+
+        Parameters
+        ----------
+        show_only_bad : :obj:`bool`, optional
+            Toggles between showing only components not meeting requirements
+            or not. Defaults to ``False``.
+        max_degree : :obj:`int`, optional
+            Maximum vertex degree, defaults to ``None``.
+        min_angle : :obj:`float`, optional
+            Sets lower bound of allowed edge angles at any vertex. Uses radians.
+            Defaults to ``None``.
+        edge_length_domain : :obj:`tuple` of :obj:`float`, optional
+            Lower and upper bounds of allowed edge lengths.
+
+        Returns
+        -------
+        :obj:`list` of :class:`Rhino.Geometry.Point3d`
+            Points representing nodes.
+        :obj:`list` of :class:`Rhino.Geometry.Line`
+            Lines representing edges.
+        :obj:`list` of :obj:`tuple` of :obj:`Rhino.Geometry.Point3d` and :obj:`str`
+            Pairs of marker placement points and marker text.
+        """
+
+        node_geo = []
+        edge_geo = []
+
+        markers = []
+
+        if show_only_bad:
+            wrong_degree, wrong_angle, wrong_edge_length = self.analyse(
+                max_degree=max_degree,
+                min_angle=min_angle,
+                edge_length_domain=edge_length_domain,
+            )
+            nodes = set([wrong_degree + wrong_angle])
+            edges = wrong_edge_length
+        else:
+            nodes = self.nodes()
+            edges = self.edges()
+
+        for key in nodes:
+            x, y, z = self.node_coordinates(key)
+            geo = txt_loc = rg.Point3d(x, y, z)
+            txt_segments = []
+
+            angle = math.degrees(self.vertex_smallest_edge_angle(key))
+            angle_txt = "A={}".format(int(angle))
+
+            degree_txt = "D={}".format(self.degree(key))
+
+            bad = show_only_bad and (key in wrong_degree or key in wrong_angle)
+            if bad:
+                node_geo.append(geo)
+
+                if key in wrong_degree:
+                    txt_segments.append(degree_txt)
+                if key in wrong_angle:
+                    txt_segments.append(angle_txt)
+            else:
+                node_geo.append(geo)
+                txt_segments = [degree_txt + angle_txt]
+
+            if len(txt_segments) > 0:
+                txt = " ".join(txt_segments)
+                markers.append((txt_loc, txt))
+
+        for u, v in edges:
+            geo = self.edge_to_rgline(u, v)
+            txt_loc = self.edge_midpoint(u, v)
+            txt = "L={}".format(int(self.edge_length(u, v)))
+
+            if not show_only_bad or (u, v) in wrong_edge_length:
+                markers.append((txt_loc, txt))
+                edge_geo.append(geo)
+
+        return node_geo, edge_geo, markers
+
     def find_closest_nhood(
         self,
         nkey_origin,
@@ -323,6 +455,30 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
                 )
                 n_conns += 1
 
+    def derive_edge_attr(self, u, v, key):
+        u_val = self.node_attribute(u, key)
+        v_val = self.node_attribute(v, key)
+
+        # remove None values
+        vals = filter(None, [u_val, v_val])
+
+        if len(vals) == 0:
+            return
+        elif len(vals) == 2 and vals[0] != vals[1]:
+            return
+
+        val = vals[0]
+
+        self.edge_attribute((u, v), key, val)
+        return val
+
+    def derive_edges_attr(self, key, ekeys=None):
+        if not ekeys:
+            ekeys = self.edges()
+
+        for u, v in ekeys:
+            self.derive_edge_attr(u, v, key)
+
     @classmethod
     def from_space_frame_mesh(cls, mesh, scale="mm"):
         # TODO: Bugfix, creates super long lines.
@@ -343,7 +499,7 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
             network.add_node(key=vkey, **data)
 
         for u, v in mesh.edges():
-            # data = mesh.edge_attributes((u, v))
+            data = mesh.edge_attributes((u, v))
             data = {"created_from": cls.FROM_MESH}
             network.add_edge(u, v, **data)
 
@@ -428,8 +584,60 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 self.collapse_edge(u, v, t=t)
         """
 
-    def analyse_mesh(
-        self, max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
+    def weld(self, precision=None):
+        """Adapted from compas.datastructures.mesh.join"""
+        geo = geometric_key
+        key_xyz = {key: self.vertex_coordinates(key) for key in self.vertices()}
+        gkey_key = {
+            geo(xyz, precision): (key, self.vertex_attributes(key))
+            for key, xyz in key_xyz.items()
+        }
+        gkey_index = {gkey: index for index, gkey in enumerate(gkey_key)}
+
+        vertices = [
+            (key_xyz[key_data[0]], key_data[1]) for gkey, key_data in gkey_key.items()
+        ]
+
+        faces = []
+        for fkey in self.faces():
+            fdata = self.face_attributes(fkey)
+            new_vkeys = []
+            for key in self.face_vertices(fkey):
+                coords = key_xyz[key]
+                gkey = geo(coords)
+                idx = gkey_index[gkey]
+                new_vkeys.append(idx)
+            faces.append((new_vkeys, fdata))
+
+        faces[:] = [
+            ([u for u, v in pairwise(face + face[:1]) if u != v], fdata)
+            for face, fdata in faces
+        ]
+
+        original_vertices = list(self.vertices())
+        for vkey in original_vertices:
+            self.delete_vertex(vkey)
+        self.cull_vertices()
+
+        for fkey in self.faces():
+            print("{} still exists".format(fkey))
+
+        for xyz, data in vertices:
+            data["x"], data["y"], data["z"] = xyz
+            self.add_vertex(key=gkey_index[geo(xyz, precision)], **data)
+
+        for vkeys, data in faces:
+            fdata = {}
+            for name in data:
+                fdata[name] = data.get(name)
+            self.add_face(vkeys, **fdata)
+
+    def analyse(
+        self,
+        max_degree=None,
+        min_angle=None,
+        max_edge_ratio_diff=None,
+        edge_length_domain=None,
     ):
         wrong_degree = []
         wrong_angle = []
@@ -450,44 +658,107 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             if not self.ok_edge_length(u, v, edge_length_domain):
                 wrong_edge_length.append((u, v))
 
-        return wrong_degree, wrong_angle, wrong_ratio, wrong_edge_length
+        return wrong_degree, wrong_angle, wrong_edge_length, wrong_ratio
 
-    def analyse_mesh_rg(
-        self, max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
+    def analyse_rg(
+        self,
+        show_only_bad=False,
+        max_degree=None,
+        min_angle=None,
+        edge_length_domain=None,
+        max_edge_ratio_diff=None,
     ):
-        wrong_degree, wrong_angle, wrong_ratio, wrong_edge_length = self.analyse_mesh(
-            max_degree, min_angle, max_edge_ratio_diff, edge_length_domain
-        )
+        """Returns Rhino.Geometry objects to visualize component properties.
 
-        wrong_degree_pt = []
-        wrong_angle_pt = []
-        wrong_ratio_line = []
-        wrong_edge_length_line = []
+        Parameters
+        ----------
+        show_only_bad : :obj:`bool`, optional
+            Toggles between showing only components not meeting requirements
+            or not. Defaults to ``False``.
+        max_degree : :obj:`int`, optional
+            Maximum vertex degree, defaults to ``None``.
+        min_angle : :obj:`float`, optional
+            Sets lower bound of allowed edge angles at any vertex. Uses radians.
+            Defaults to ``None``.
+        edge_length_domain : :obj:`tuple` of :obj:`float`, optional
+            Lower and upper bounds of allowed edge lengths.
 
-        for vkey in wrong_degree:
-            x, y, z = self.vertex_coordinates(vkey)
-            wrong_degree_pt.append(rg.Point3d(x, y, z))
+        Returns
+        -------
+        :obj:`list` of :class:`Rhino.Geometry.Point3d`
+            Points representing nodes.
+        :obj:`list` of :class:`Rhino.Geometry.Line`
+            Lines representing edges.
+        :obj:`list` of :obj:`tuple` of :obj:`Rhino.Geometry.Point3d` and :obj:`str`
+            Pairs of marker placement points and marker text.
+        """
 
-        for vkey in wrong_angle:
-            x, y, z = self.vertex_coordinates(vkey)
-            wrong_angle_pt.append(rg.Point3d(x, y, z))
+        vertex_geos = []
+        edge_geos = []
 
-        for fkey in wrong_ratio:
-            face_mesh = Mesh()
-            new_fkeys = []
-            for x, y, z in self.face_coordinates(fkey):
-                new_fkeys.append(face_mesh.add_vertex(x=x, y=y, z=z))
-            face_mesh.add_face(new_fkeys)
+        markers = []
 
-            artist = MeshArtist(face_mesh)
+        if show_only_bad:
+            wrong_degree, wrong_angle, wrong_edge_length, wrong_ratio = self.analyse(
+                max_degree=max_degree,
+                min_angle=min_angle,
+                edge_length_domain=edge_length_domain,
+                max_edge_ratio_diff=max_edge_ratio_diff,
+            )
+            vertices = set([wrong_degree + wrong_angle])
+            edges = wrong_edge_length
+            faces = wrong_ratio
+        else:
+            vertices = self.vertices()
+            edges = self.edges()
+            faces = self.faces()
 
-            wrong_ratio_line.append(artist.draw_mesh())
+        for key in vertices:
+            x, y, z = self.vertex_coordinates(key)
+            txt_loc = [x, y, z]
+            geo = rg.Point3d(x, y, z)
+            txt_segments = []
 
-        for u, v in wrong_edge_length:
-            line = self.edge_to_rgline(u, v)
-            wrong_edge_length_line.append(line)
+            angle = math.degrees(self.vertex_smallest_edge_angle(key))
+            angle_txt = "A={}".format(int(angle))
 
-        return wrong_degree_pt, wrong_angle_pt, wrong_ratio_line, wrong_edge_length_line
+            degree_txt = "D={}".format(self.vertex_degree(key))
+
+            bad = show_only_bad and (key in wrong_degree or key in wrong_angle)
+            if bad:
+                vertex_geos.append(geo)
+
+                if key in wrong_degree:
+                    txt_segments.append(degree_txt)
+                if key in wrong_angle:
+                    txt_segments.append(angle_txt)
+            else:
+                vertex_geos.append(geo)
+                txt_segments = [degree_txt + angle_txt]
+
+            if len(txt_segments) > 0:
+                txt = " ".join(txt_segments)
+                markers.append((txt_loc, txt))
+
+        for u, v in edges:
+            geo = self.edge_to_rgline(u, v)
+            txt_loc = self.edge_midpoint(u, v)
+            txt = "L={}".format(int(self.edge_length(u, v)))
+
+            markers.append((txt_loc, txt))
+            edge_geos.append(geo)
+
+        for fkey in faces:
+            txt_loc = self.face_center(fkey)
+            edge_length_ratios = self.edge_length_ratios(fkey)
+            _, smallest_longest_ratio = edge_length_ratios[-1]
+            txt = "R={}".format(round(smallest_longest_ratio))
+
+            markers.append((txt_loc, txt))
+
+        markers = [(rg.Point3d(*loc), txt) for loc, txt in markers]
+
+        return vertex_geos, edge_geos, markers
 
     def ok_subd(
         self,
