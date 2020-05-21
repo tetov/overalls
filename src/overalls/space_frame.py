@@ -705,7 +705,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
                 edge_length_domain=edge_length_domain,
                 max_edge_ratio_diff=max_edge_ratio_diff,
             )
-            vertices = set([wrong_degree + wrong_angle])
+            vertices = set((wrong_degree + wrong_angle))
             edges = wrong_edge_length
             faces = wrong_ratio
         else:
@@ -775,12 +775,12 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         if max_degree:
             if not self.ok_degree(old_vkeys, max_degree):
-                print("Not ok_subd due to vertex degrees")
+                # print("Not ok_subd due to vertex degrees")
                 return False
 
         if min_angle:
             if not self.ok_edges_angles(flatten([old_vkeys + new_vkeys]), min_angle):
-                print("Not ok_subd due to edge angles.")
+                # print("Not ok_subd due to edge angles.")
                 return False
 
         if edge_length_domain:
@@ -788,7 +788,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             ekeys = flatten(ekeys)
             uv_sets = set(frozenset((u, v)) for u, v in ekeys)  # unique edges
             if not self.ok_edge_lengths(uv_sets, edge_length_domain):
-                print("Not ok_subd due to edge length constraints.")
+                # print("Not ok_subd due to edge length constraints.")
                 return False
 
         if max_edge_ratio_diff:
@@ -1282,7 +1282,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
             try:
                 self.edge_attribute((start_vertex, end_vertex), label, line_data)
-                print(self.edge_attribute((start_vertex, end_vertex), label))
+                # print(self.edge_attribute((start_vertex, end_vertex), label))
             except KeyNotFoundException:
                 exists = self.has_edge((start_vertex, end_vertex))
                 reverse_exists = self.has_edge((end_vertex, start_vertex))
