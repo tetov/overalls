@@ -25,6 +25,15 @@ from System.Collections.Generic import KeyNotFoundException
 
 
 class SpaceFrameMixin(object):
+    def nv_degree(self, key):
+        raise NotImplementedError
+
+    def nvs(self):
+        raise NotImplementedError
+
+    def nv_neighbors(self, key):
+        raise NotImplementedError
+
     def get_bbox_origin(self):
         if hasattr(self, "nodes"):
             pts = [self.node_coordinates(key) for key in self.nodes()]
@@ -57,18 +66,15 @@ class SpaceFrameMixin(object):
         for v in nbors:
             yield (u, v)
 
-    def ok_degree(self, keys, max_degree):
+    def ok_degree(self, key, max_degree):
         if not max_degree:
             return True
+        return self.nv_degree(key) <= max_degree
 
-        if isinstance(self, Network):
-            degree_func = self.degree
-        else:
-            degree_func = self.vertex_degree
-
+    def ok_degrees(self, keys, max_degree):
         keys = to_list(keys)
         for key in keys:
-            if degree_func(key) > max_degree:
+            if not self.ok_degree(key, max_degree):
                 return False
         return True
 
@@ -211,6 +217,15 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
         )
         self.update_default_node_attributes(created_from=None, part_id=None)
 
+    def nv_degree(self, key):
+        return self.degree(key)
+
+    def nvs(self):
+        return self.nodes()
+
+    def nv_neighbors(self, key):
+        return self.neighbors(key)
+
     def transform_network(self, transformation):
         nodes = [self.node_coordinates(key) for key in self.nodes()]
         xyz = transform_points(nodes, transformation)
@@ -282,7 +297,7 @@ class SpaceFrameNetwork(SpaceFrameMixin, Network):
             return False
 
         if max_degree:
-            if not self.ok_degree([u, v], max_degree):
+            if not self.ok_degrees([u, v], max_degree):
                 # print("Not ok_conn because vertex_degree: {}-{}".format(u, v))
                 return False
 
@@ -564,6 +579,15 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
             parent_fkey=None, created_from=None, structural_data=None, part_id=None
         )
 
+    def nv_degree(self, key):
+        return self.vertex_degree(key)
+
+    def nvs(self):
+        return self.vertices()
+
+    def nv_neighbors(self, key):
+        return self.vertex_neighbors(key)
+
     def delete_face(self, fkey):
         try:
             super(SpaceFrameMesh, self).delete_face(fkey)
@@ -774,7 +798,7 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         new_vkeys = to_list(new_vkeys)
 
         if max_degree:
-            if not self.ok_degree(old_vkeys, max_degree):
+            if not self.ok_degrees(old_vkeys, max_degree):
                 # print("Not ok_subd due to vertex degrees")
                 return False
 
@@ -818,6 +842,30 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
 
         return pt
 
+    def estimate_subd_face_edge_angles(self, fkey):
+        est_vec_angles = []
+        for vkey in self.face_vertices(fkey):
+            prev_vkey = self.face_vertex_ancestor(fkey, vkey)
+            next_vkey = self.face_vertex_descendant(fkey, vkey)
+
+            origin_xyz = self.vertex_coordinates(vkey)
+            prev_xyz = self.vertex_coordinates(prev_vkey)
+            next_xyz = self.vertex_coordinates(next_vkey)
+
+            vec_a = rg.Vector3d(*prev_xyz) - rg.Vector3d(*origin_xyz)
+            vec_b = rg.Vector3d(*next_xyz) - rg.Vector3d(*origin_xyz)
+
+            vec_angle = rg.Vector3d.VectorAngle(vec_a, vec_b)
+            est_vec_angles.append(vec_angle / 2)
+        return est_vec_angles
+
+    def estimate_subd_edge_length(self, fkey):
+        cur_lengths = [self.edge_length(u, v) for u, v in self.face_halfedges(fkey)]
+
+        avg_cur_length = sum(cur_lengths) / len(cur_lengths)
+
+        return avg_cur_length / 2
+
     @staticmethod
     def _get_next_cycle(var):
         var = next(var)
@@ -826,6 +874,83 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         if not isinstance(var, Sequence):
             var = to_list(var)
         return cycle(var)
+
+    def subdiv_faces_static(
+        self,
+        fkeys,
+        n_iters=None,
+        scheme=[0],
+        rel_pos=None,
+        max_iters=None,
+        move_z=None,
+        max_degree=None,
+        min_angle=None,
+        edge_length_domain=None,
+        **kwargs
+    ):
+        # repeating_n_iters = cycle(n_iters) if n_iters else None
+        subdiv_cycler = cycle(scheme)
+        # repeating_rel_pos = cycle(to_list(rel_pos)) if rel_pos else None
+        # repeating_move_z = cycle(to_list(move_z)) if move_z else None
+
+        subdiv_funcs = [
+            self.face_subdiv_pyramid,
+            self.face_subdiv_mid_cent,
+            self.face_subdiv_mids,
+            self.face_subdiv_split,
+            self.face_subdiv_frame,
+        ]
+
+        if not n_iters:
+            raise NotImplementedError
+
+        fkeys = set(fkeys)
+
+        next_iter = fkeys
+        i = 0
+        while i < n_iters:
+            print(i)
+            i += 1
+
+            subdiv_func_per_iter = self._get_next_cycle(subdiv_cycler)
+            to_subd = next_iter
+            next_iter = []
+            filtered_to_subd = []
+            for fkey in to_subd:
+                face_verts = self.face_vertices(fkey)
+                halfedges = self.face_halfedges(fkey)
+
+                # check current state versus requirements
+                if not self.ok_degrees(face_verts, max_degree - 1):
+                    continue
+
+                if not self.ok_edges_angles(face_verts, min_angle):
+                    continue
+
+                if not self.ok_edge_lengths(halfedges, (edge_length_domain[0], None)):
+                    continue
+
+                # check estimated subd state versus requirements
+                new_edge_angles = self.estimate_subd_face_edge_angles(fkey)
+                new_edge_angles.sort()
+
+                if new_edge_angles[0] < min_angle:
+                    continue
+
+                new_edge_length = self.estimate_subd_edge_length(fkey)
+
+                if new_edge_length < edge_length_domain[0]:
+                    continue
+
+                filtered_to_subd.append(fkey)
+
+            for fkey in filtered_to_subd:
+                subdiv_func_idx = next(subdiv_func_per_iter)
+                subdiv_func = subdiv_funcs[subdiv_func_idx]
+
+                new_vkeys, new_fkeys, _ = subdiv_func(fkey,)
+
+                next_iter += new_fkeys
 
     def subdiv_faces(
         self,
@@ -850,13 +975,16 @@ class SpaceFrameMesh(SpaceFrameMixin, Mesh):
         repeating_move_z = cycle(to_list(move_z)) if move_z else None
 
         fkeys = set(fkeys)
+
         while len(fkeys) > 0:
             fkey = fkeys.pop()
 
             if n_iters:
                 n_iters = next(repeating_n_iters)
-            else:
+            elif self.face_attribute(fkey, "n_iters"):
                 n_iters = self.face_attribute(fkey, "n_iters")
+            else:
+                n_iters = 0
 
             if max_iters:
                 n_iters = n_iters if n_iters < max_iters else max_iters
