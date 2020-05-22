@@ -1,16 +1,7 @@
 import Rhino.Geometry as rg
 
-
-def plane_normal_to_rgplane(plane_normal):
-    pt, normal = plane_normal
-
-    return rg.Plane(rg.Point3d(*pt), rg.Vector3d(*normal))
-
-
-def rgplane_to_plane_normal(rgplane):
-    pt = rgplane.Origin
-    normal = rgplane.Normal
-    return ((pt.X, pt.Y, pt.Z), (normal.X, normal.Y, normal.Z))
+from overalls.utils import plane_normal_to_rgplane
+from overalls.utils import rgplane_to_plane_normal
 
 
 class BundleProfile(object):

@@ -2,6 +2,18 @@ import Rhino.Geometry as rg
 from compas.datastructures import Network
 
 
+def plane_normal_to_rgplane(plane_normal):
+    pt, normal = plane_normal
+
+    return rg.Plane(rg.Point3d(*pt), rg.Vector3d(*normal))
+
+
+def rgplane_to_plane_normal(rgplane):
+    pt = rgplane.Origin
+    normal = rgplane.Normal
+    return ((pt.X, pt.Y, pt.Z), (normal.X, normal.Y, normal.Z))
+
+
 def rglines_from_edges(mesh, nkeys=None):
     if nkeys is None:
         nkeys = mesh.edges()
