@@ -20,6 +20,7 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
     def __init__(self):
         super(SpaceFrameMesh, self).__init__()
+
         self.update_default_face_attributes(
             parent_fkey=None, created_from=None, n_iters=0, part_id=None
         )
@@ -27,7 +28,11 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
             parent_fkey=None, created_from=None, part_id=None
         )
         self.update_default_edge_attributes(
-            parent_fkey=None, created_from=None, structural_data=None, part_id=None
+            parent_fkey=None,
+            created_from=None,
+            structural_data=None,
+            part_id=None,
+            ignore_edge=False,
         )
 
     def nv_degree(self, key, *args, **kwargs):
@@ -44,6 +49,9 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
     def nv_attribute(self, u, v, key, *args, **kwargs):
         return self.vertex_attribute(u, v, key, *args, **kwargs)
+
+    def update_default_nv_attributes(self, **kwattr):
+        return self.update_default_vertex_attributes(**kwattr)
 
     def delete_face(self, fkey):
         try:
@@ -107,7 +115,7 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
         old_vkeys,
         new_vkeys,
         new_fkeys,
-        max_degree=None,
+        degree_domain=None,
         min_angle=None,
         edge_length_domain=None,
         max_edge_ratio_diff=None,
@@ -115,8 +123,8 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
     ):
         new_vkeys = to_list(new_vkeys)
 
-        if max_degree:
-            if not self.ok_degrees(old_vkeys, max_degree):
+        if degree_domain:
+            if not self.ok_degrees(old_vkeys, degree_domain):
                 # print("Not ok_subd due to vertex degrees")
                 return False
 
@@ -201,7 +209,7 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
         rel_pos=None,
         max_iters=None,
         move_z=None,
-        max_degree=None,
+        degree_domain=None,
         min_angle=None,
         edge_length_domain=None,
         **kwargs
@@ -213,9 +221,10 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
         subdiv_funcs = [
             self.face_subdiv_pyramid,
-            self.face_subdiv_mid_cent,
-            self.face_subdiv_mids,
-            self.face_subdiv_split,
+            self.face_subdiv_mid2center,
+            self.face_subdiv_mids2mids,
+            self.face_subdiv_split_in_half,
+            self.face_subdiv_split_mid2mid,
             self.face_subdiv_frame,
         ]
 
@@ -228,7 +237,6 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
         deleted_fkeys = set()
         i = 0
         while i < n_iters:
-            print(i)
             i += 1
 
             subdiv_func_per_iter = self._get_next_cycle(subdiv_cycler)
@@ -240,7 +248,10 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
                 halfedges = self.face_halfedges(fkey)
 
                 # check current state versus requirements
-                if not self.ok_degrees(face_verts, max_degree - 1):
+                degree_min, degree_max = degree_domain
+                degree_min = degree_min - 1 if degree_min else None
+                degree_max = degree_max + 1 if degree_max else None
+                if not self.ok_degrees(face_verts, (degree_min, degree_max)):
                     continue
 
                 if not self.ok_edges_angles(face_verts, min_angle):
@@ -291,9 +302,10 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
     ):
         subdiv_funcs = [
             self.face_subdiv_pyramid,
-            self.face_subdiv_mid_cent,
-            self.face_subdiv_mids,
-            self.face_subdiv_split,
+            self.face_subdiv_mid2center,
+            self.face_subdiv_mids2mids,
+            self.face_subdiv_split_in_half,
+            self.face_subdiv_split_mid2mid,
             self.face_subdiv_frame,
         ]
         repeating_n_iters = cycle(n_iters) if n_iters else None
@@ -396,7 +408,6 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
         deleted_faces = []
 
         for u, v in halfedges:
-            print(self.has_edge((u, v)))
             adj_faces = [key for key in self.edge_faces(u, v) if key != fkey]
             adj_face = adj_faces.pop()
             adj_face_verts = self.face_vertices(adj_face) if adj_face else None
@@ -409,14 +420,15 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
                 split_from = new_vkeys[-1]
                 split_to = self.face_vertex_descendant(adj_face, split_from, n=2)
 
-                self.split_face(adj_face, split_from, split_to)
+                new_fkeys += self.split_face(adj_face, split_from, split_to)
 
-                new_fkeys += self.edge_faces(split_from, split_to)
+                self.edge_attribute((split_from, split_to), "ignore_edge", True)
+
                 self.delete_face(adj_face)
 
         return new_vkeys, new_fkeys, deleted_faces
 
-    def face_subdiv_mid_cent(self, fkey, rel_pos=None, move_z=None, **kwattr):
+    def face_subdiv_mid2center(self, fkey, rel_pos=None, move_z=None, **kwattr):
         xyz = Point(*self.face_center(fkey))
 
         x, y, z = self._move_center_pt(xyz, fkey, rel_pos, move_z)
@@ -442,7 +454,7 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
         return new_vkeys, new_fkeys, deleted_faces
 
-    def face_subdiv_mids(self, fkey, **kwattr):
+    def face_subdiv_mids2mids(self, fkey, **kwattr):
         # remove rel_pos and rel_pos_z since they don't apply
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
@@ -466,17 +478,50 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
         return new_vkeys, new_fkeys, deleted_faces
 
-    def face_subdiv_split(self, fkey, split_even=True, shift_split=False, **kwattr):
+    def face_subdiv_split_in_half(self, fkey, shift_split=False, **kwattr):
         # remove rel_pos and rel_pos_z since they don't apply
         kwattr.pop("rel_pos", None)
         kwattr.pop("rel_pos_z", None)
-        tri_split_equal = kwattr.pop("tri_split_equal", None)
 
-        if tri_split_equal:
-            raise DeprecationWarning(
-                "Changed the name of this keyword argument to split_even."
-            )
-            split_even = tri_split_equal
+        new_vkeys = []
+        new_fkeys = []
+        deleted_faces = [(fkey, self.face_vertices(fkey))]
+
+        face_halfedges = self.face_halfedges(fkey)
+
+        u1, v1 = face_halfedges[0 + shift_split]
+
+        if len(face_halfedges) < 4:
+            _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(fkey, [(u1, v1)])
+            new_vkeys += _new_vkeys
+            new_fkeys += _new_fkeys
+            deleted_faces += _deleted_faces
+
+            e_mid1 = new_vkeys[-1]
+
+            u2, v2 = face_halfedges[1 + shift_split]
+
+            new_face_verts1 = [u1, e_mid1, v2]
+            new_face_verts2 = [e_mid1, v1, v2]
+
+            new_fkeys.append(self.add_face(new_face_verts1))
+            new_fkeys.append(self.add_face(new_face_verts2))
+
+        else:
+            split_from = u1
+            split_to_idx = len(face_halfedges) // 2  # support ngon for fun
+            split_to = self.face_vertex_ancestor(fkey, u1, n=split_to_idx)
+
+            new_fkeys += self.split_face(fkey, split_from, split_to)
+
+        self.delete_face(fkey)
+
+        return new_vkeys, new_fkeys, deleted_faces
+
+    def face_subdiv_split_mid2mid(self, fkey, shift_split=False, **kwattr):
+        # remove rel_pos and rel_pos_z since they don't apply
+        kwattr.pop("rel_pos", None)
+        kwattr.pop("rel_pos_z", None)
 
         face_halfedges = self.face_halfedges(fkey)
         # print("fkeys: {}, halfedges: {}".format(face_vertices, face_halfedges))
@@ -488,42 +533,22 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
 
         e_mid1 = new_vkeys[-1]
 
+        u2, v2 = face_halfedges[2 + shift_split]
+
+        _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(fkey, [(u2, v2)])
+        new_vkeys += _new_vkeys
+        new_fkeys += _new_fkeys
+        deleted_faces += _deleted_faces
+
+        e_mid2 = new_vkeys[-1]
+
         if len(face_halfedges) == 3:
-            u2, v2 = face_halfedges[1 + shift_split]
-            if split_even:
-                # tri split in half
 
-                new_face_verts1 = [u1, e_mid1, v2]
-                new_face_verts2 = [e_mid1, v1, v2]
-            else:
-                # tri face split into one quad and one tri
-
-                _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(
-                    fkey, [(u2, v2)]
-                )
-                new_vkeys += _new_vkeys
-                new_fkeys += _new_fkeys
-                deleted_faces += _deleted_faces
-
-                e_mid2 = new_vkeys[-1]
-
-                new_face_verts1 = [u1, e_mid1, e_mid2, v2]
-                new_face_verts2 = [e_mid1, u2, e_mid2]
+            new_face_verts1 = [u1, e_mid1, e_mid2, v2]
+            new_face_verts2 = [e_mid1, u2, e_mid2]
 
         else:
-            if split_even:
-                raise NotImplementedError()
             # Quad face into two smaller quad faces
-
-            # Get edge opposite (u1, v1)
-            u2, v2 = face_halfedges[2 + shift_split]
-
-            _new_vkeys, _new_fkeys, _deleted_faces = self._split_edges(fkey, [(u2, v2)])
-            new_vkeys += _new_vkeys
-            new_fkeys += _new_fkeys
-            deleted_faces += _deleted_faces
-
-            e_mid2 = new_vkeys[-1]
 
             new_face_verts1 = [u1, e_mid1, e_mid2, v2]
             new_face_verts2 = [e_mid1, v1, u2, e_mid2]

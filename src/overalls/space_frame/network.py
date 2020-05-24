@@ -17,10 +17,16 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
 
     def __init__(self):
         super(SpaceFrameNetwork, self).__init__()
-        self.update_default_edge_attributes(
-            created_from=None, part_id=None, structural_data=None
+        self.update_default_node_attributes(
+            parent_fkey=None, created_from=None, part_id=None
         )
-        self.update_default_node_attributes(created_from=None, part_id=None)
+        self.update_default_edge_attributes(
+            parent_fkey=None,
+            created_from=None,
+            structural_data=None,
+            part_id=None,
+            ignore_edge=False,
+        )
 
     def nv_degree(self, key, *args, **kwargs):
         return self.degree(key, *args, **kwargs)
@@ -85,14 +91,14 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
         keys, _ = zip(*dists)
         return keys[0]
 
-    def ok_conn(self, u, v, max_degree, min_angle):
+    def ok_conn(self, u, v, degree_domain, min_angle):
         # print("Testing connection {}-{}".format(u, v))
         if self.has_edge(u, v, directed=False):
             # print("Not ok_conn because has_edge")
             return False
 
-        if max_degree:
-            if not self.ok_degrees([u, v], max_degree):
+        if degree_domain:
+            if not self.ok_degrees([u, v], degree_domain):
                 # print("Not ok_conn because vertex_degree: {}-{}".format(u, v))
                 return False
 
@@ -136,7 +142,12 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
         return nbors
 
     def connect_nodes(
-        self, start_nkey, end_nkeys, max_degree=None, min_angle=None, max_n_conn=None,
+        self,
+        start_nkey,
+        end_nkeys,
+        degree_domain=None,
+        min_angle=None,
+        max_n_conn=None,
     ):
         """Create a line node to node."""
         u = start_nkey
@@ -152,8 +163,11 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
                     break
 
             # max_degree-1 because we will add one
-            ok_degree = max_degree - 1 if max_degree else None
-            if self.ok_conn(u, v, ok_degree, min_angle):
+            min_degree, max_degree = degree_domain
+            min_degree = min_degree + 1 if min_degree else None
+            max_degree = max_degree - 1 if max_degree else None
+
+            if self.ok_conn(u, v, (min_degree, max_degree), min_angle):
                 self.add_edge(
                     u,
                     v,
@@ -163,7 +177,7 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
                 n_conns += 1
 
     @classmethod
-    def from_space_frame_mesh(cls, mesh, scale="mm"):
+    def from_space_frame_mesh(cls, mesh, scale="mm", check_ignore_edge_attr=True):
         # TODO: Bugfix, creates super long lines.
         if scale != "mm":
             raise NotImplementedError("Scaling needs fixing.")
@@ -183,6 +197,8 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
 
         for u, v in mesh.edges():
             data = mesh.edge_attributes((u, v))
+            if check_ignore_edge_attr and data.get("ignore_edge"):
+                continue
             data = {"created_from": cls.FROM_MESH}
             network.add_edge(u, v, **data)
 

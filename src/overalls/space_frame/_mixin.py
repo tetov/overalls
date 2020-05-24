@@ -95,21 +95,25 @@ class SpaceFrameMixin(object):
             self.dist_dict[u][v] = dist
             self.dist_dict[v][u] = dist
 
-    def connected_edges(self, key):
+    def connected_edges(self, key, check_ignore_edge_attr=True):
         u = key
 
         for v in self.nv_neighbors(u):
+            if check_ignore_edge_attr:
+                if self.edge_attribute((u, v), "ignore_edge"):
+                    continue
+
             yield (u, v)
 
-    def ok_degree(self, key, max_degree):
-        if not max_degree:
+    def ok_degree(self, key, degree_domain):
+        if not degree_domain:
             return True
-        return self.nv_degree(key) <= max_degree
+        return is_in_domain(self.nv_degree(key), degree_domain)
 
-    def ok_degrees(self, keys, max_degree):
+    def ok_degrees(self, keys, degree_domain):
         keys = to_list(keys)
         for key in keys:
-            if not self.ok_degree(key, max_degree):
+            if not self.ok_degree(key, degree_domain):
                 return False
         return True
 
@@ -152,6 +156,9 @@ class SpaceFrameMixin(object):
 
     def edge_length_ratios(self, fkey):
         edges = self.face_halfedges(fkey)
+        edges = [
+            (u, v) for u, v in edges if not self.edge_attribute((u, v), "ignore_edge")
+        ]
         edge_lengths = []
 
         for u, v in edges:
@@ -184,7 +191,7 @@ class SpaceFrameMixin(object):
 
     def analyse(
         self,
-        max_degree=None,
+        degree_domain=None,
         min_angle=None,
         max_edge_ratio_diff=None,
         edge_length_domain=None,
@@ -195,7 +202,7 @@ class SpaceFrameMixin(object):
         wrong_ratio = []
 
         for key in self.nvs():
-            if not self.ok_degree(key, max_degree):
+            if not self.ok_degree(key, degree_domain):
                 wrong_degree.append(key)
             if not self.ok_edge_angles(key, min_angle):
                 wrong_angle.append(key)
@@ -214,7 +221,7 @@ class SpaceFrameMixin(object):
     def analyse_rg(
         self,
         show_only_bad=False,
-        max_degree=None,
+        degree_domain=None,
         min_angle=None,
         edge_length_domain=None,
         max_edge_ratio_diff=None,
@@ -226,8 +233,9 @@ class SpaceFrameMixin(object):
         show_only_bad : :obj:`bool`, optional
             Toggles between showing only components not meeting requirements
             or not. Defaults to ``False``.
-        max_degree : :obj:`int`, optional
+        degree_domain : :`tuple` of :obj:`float`, optional
             Maximum vertex degree, defaults to ``None``.
+            Lower and upper bounds of allowed node or vertex degrees.
         min_angle : :obj:`float`, optional
             Sets lower bound of allowed edge angles at any vertex. Uses radians.
             Defaults to ``None``.
@@ -245,7 +253,7 @@ class SpaceFrameMixin(object):
         """
         if show_only_bad:
             wrong_degree, wrong_angle, wrong_edge_length, wrong_ratio = self.analyse(
-                max_degree=max_degree,
+                degree_domain=degree_domain,
                 min_angle=min_angle,
                 edge_length_domain=edge_length_domain,
                 max_edge_ratio_diff=max_edge_ratio_diff,
@@ -356,13 +364,16 @@ class SpaceFrameMixin(object):
         pt_b = rg.Point3d(*pt_b)
         return rg.Line(pt_a, pt_b)
 
-    def to_rglines(self, ekeys=None):
+    def to_rglines(self, ekeys=None, check_ignore_edge_attr=True):
         if ekeys is None:
             ekeys = self.edges()
 
         lines = []
 
         for u, v in ekeys:
+            if check_ignore_edge_attr and self.edge_attribute((u, v), "ignore_edge"):
+                continue
+
             lines.append(self.edge_to_rgline(u, v))
 
         return list_to_tree(lines)
