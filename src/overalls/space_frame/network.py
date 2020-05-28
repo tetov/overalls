@@ -18,7 +18,7 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
     def __init__(self):
         super(SpaceFrameNetwork, self).__init__()
         self.update_default_node_attributes(
-            parent_fkey=None, created_from=None, part_id=None
+            parent_fkey=None, created_from=None, part_id=None, on_boundary=False
         )
         self.update_default_edge_attributes(
             parent_fkey=None,
@@ -26,6 +26,7 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
             structural_data=None,
             part_id=None,
             ignore_edge=False,
+            on_boundary=False,
         )
 
     def nv_degree(self, key, *args, **kwargs):
@@ -55,6 +56,70 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
             attr["z"] = xyz[index][2]
 
         self.build_dist_dict()
+
+    def add_edges_from_lines(self, lines):
+        gkey_nkey = {}
+        for nkey in self.nvs():
+            xyz = self.node_coordinates(nkey)
+            gkey = geometric_key(xyz, precision="d")
+            gkey_nkey[gkey] = nkey
+
+        for line in lines:
+            u_pt = line.From
+            v_pt = line.To
+            u_gkey = geometric_key([u_pt.X, u_pt.Y, u_pt.Z], precision="d")
+            v_gkey = geometric_key([v_pt.X, v_pt.Y, v_pt.Z], precision="d")
+            u_nkey = gkey_nkey[u_gkey]
+            v_nkey = gkey_nkey[v_gkey]
+
+            self.add_edge(u_nkey, v_nkey)
+
+    def create_conn_dict_static(
+        self,
+        node_keys=None,
+        grouped_keys=False,
+        min_angle=None,
+        max_node_degree=None,
+        length_domain=None,
+        **kwargs
+    ):
+        if not node_keys:
+            from_nkeys_list = [self.nvs()]
+            to_nkeys_list = [self.nvs()]
+        elif grouped_keys:
+            from_nkeys_list = node_keys[: len(node_keys) - 1]
+            to_nkeys_list = node_keys[1:]  # shift to keys once
+        else:
+            from_nkeys_list = [node_keys]
+            to_nkeys_list = [node_keys]
+
+        conn_dict = {}
+        self.ensure_dist_dict()
+        for i, from_nkeys in enumerate(from_nkeys_list):
+            to_nkeys = to_nkeys_list[i]
+
+            for from_nkey in from_nkeys:
+                conn_dict[from_nkey] = []
+
+                for to_nkey in to_nkeys:
+                    existing_conns = conn_dict.get(to_nkey)
+
+                    if existing_conns:
+                        if from_nkey in existing_conns:
+                            continue
+
+                    if self.ok_conn(
+                        from_nkey,
+                        to_nkey,
+                        degree_domain=(None, max_node_degree),
+                        min_angle=min_angle,
+                        length_domain=length_domain,
+                    ):
+                        continue
+
+                    conn_dict[from_nkey].append(to_nkey)
+
+        return conn_dict
 
     def find_closest_node(
         self,
@@ -89,9 +154,10 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
         dists = dists.items()
         dists.sort(key=lambda x: x[1], reverse=prefer_distant)
         keys, _ = zip(*dists)
+
         return keys[0]
 
-    def ok_conn(self, u, v, degree_domain, min_angle):
+    def ok_conn(self, u, v, degree_domain=None, min_angle=None, length_domain=None):
         # print("Testing connection {}-{}".format(u, v))
         if self.has_edge(u, v, directed=False):
             # print("Not ok_conn because has_edge")
@@ -105,6 +171,11 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
         if min_angle:
             if not self.ok_edges_angles([u, v], min_angle, additional_edge=(u, v)):
                 # print("Not ok_conn because vertex_angles: {}-{}".format(u, v))
+                return False
+
+        if length_domain:
+            if not self.ok_edge_length(u, v, length_domain):
+                # print("Not ok_conn because edge_length: {}-{}".format(u, v))
                 return False
 
         # print("{}-{} passed ok_conn".format(u, v))
@@ -141,13 +212,45 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
 
         return nbors
 
-    def connect_nodes(
+    def connect_nodes_from_dict(
         self,
-        start_nkey,
-        end_nkeys,
-        degree_domain=None,
-        min_angle=None,
+        conn_dict,
         max_n_conn=None,
+        prefer_distant=False,
+        shift_conn_list=0,
+        max_node_degree=None,
+    ):
+        new_edges = []
+        for from_nkey, to_nkeys in conn_dict.iteritems():
+            if max_node_degree:
+                to_nkeys = [
+                    nkey
+                    for nkey in to_nkeys
+                    if self.nv_degree(nkey) + 1 <= max_node_degree
+                ]
+
+            to_nkeys.sort(
+                key=lambda to_nkey: self.nv_degree(to_nkey), reverse=prefer_distant,
+            )
+
+            from_idx = 0 + shift_conn_list
+
+            if max_n_conn:
+                to_idx = from_idx + max_n_conn
+                to_nkeys = to_nkeys[from_idx:to_idx]
+            else:
+                to_nkeys = to_nkeys[from_idx:] + to_nkeys[:from_idx]
+
+            print(len(to_nkeys))
+
+            for to_nkey in to_nkeys:
+                new_edges.append((from_nkey, to_nkey))
+
+        for u, v in new_edges:
+            self.add_edge(u, v, created_from=self.FROM_CONN)
+
+    def connect_nodes(
+        self, start_nkey, end_nkeys, degree_domain=None, min_angle=None, max_n_conn=None
     ):
         """Create a line node to node."""
         u = start_nkey
@@ -167,7 +270,9 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
             min_degree = min_degree + 1 if min_degree else None
             max_degree = max_degree - 1 if max_degree else None
 
-            if self.ok_conn(u, v, (min_degree, max_degree), min_angle):
+            if self.ok_conn(
+                u, v, degree_domain=(min_degree, max_degree), min_angle=min_angle
+            ):
                 self.add_edge(
                     u,
                     v,
@@ -192,14 +297,24 @@ class SpaceFrameNetwork(Network, SpaceFrameMixin):
 
         for vkey in mesh.vertices():
             data = mesh.vertex_attributes(vkey)
-            data.update({"created_from": cls.FROM_MESH})
+            data.update(
+                {
+                    "created_from": cls.FROM_MESH,
+                    "on_boundary": mesh.is_vertex_on_boundary(vkey),
+                }
+            )
             network.add_node(key=vkey, **data)
 
         for u, v in mesh.edges():
             data = mesh.edge_attributes((u, v))
             if check_ignore_edge_attr and data.get("ignore_edge"):
                 continue
-            data = {"created_from": cls.FROM_MESH}
+            data.update(
+                {
+                    "created_from": cls.FROM_MESH,
+                    "on_boundary": mesh.is_edge_on_boundary(u, v),
+                }
+            )
             network.add_edge(u, v, **data)
 
         return network

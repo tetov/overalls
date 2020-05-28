@@ -14,6 +14,70 @@ from overalls.utils import flatten
 from overalls.utils import to_list
 
 
+class SubdResult(object):
+    def __init__(self, mesh):
+        self.mesh = mesh
+        self.new_vkeys = []
+        self.new_fkeys = []
+        self.deleted_faces = {}
+        self.adj_to_split = {}
+
+    def add_deleted_face(self, fkey):
+        print("Before {}".format(self.deleted_faces))
+        self.deleted_faces[fkey] = self.mesh.face_vertices(fkey)
+        print("After {}".format(self.deleted_faces))
+
+    def get_deleted_faces(self):
+        return self.deleted_faces.items()
+
+    def get_deleted_fkeys(self):
+        return self.deleted_faces.keys()
+
+    def add_adj_to_split(self, fkey, split_from):
+        if self.adj_to_split.get(fkey):
+            self.adj_to_split[fkey].append(split_from)
+        else:
+            self.adj_to_split[fkey] = [split_from]
+
+    def get_adj_to_split(self):
+        return self.adj_to_split.iteritems()
+
+    def merge(self, other):
+        self.new_vkeys += other.new_vkeys
+        self.new_fkeys += other.new_fkeys
+
+        for key, value in other.deleted_faces.items():
+            if key in self.keys():
+                raise
+
+            self.deleted_faces[key] = value
+
+        for fkey, split_froms in other.adj_to_split.items():
+            if self.adj_to_split.get(fkey):
+                self.adj_to_split[fkey] += split_froms
+            else:
+                self.adj_to_split[fkey] = split_froms
+
+    def __add__(self, other):
+        sum_ = SubdResult(self.mesh)
+        sum_.new_vkeys = self.new_vkeys + other.new_vkeys
+        sum_.new_fkeys = self.new_fkeys + other.new_vkeys
+
+        print(self.deleted_faces)
+        print(other.deleted_faces)
+        sum_.deleted_faces.update(self.deleted_faces)
+        sum_.deleted_faces.update(other.deleted_faces)
+
+        sum_.adj_to_split = {}
+        adj_split_list = list(self.get_adj_to_split()) + list(other.get_adj_to_split())
+        for fkey, split_froms in adj_split_list:
+            if sum_.adj_to_split.get(fkey):
+                sum_.adj_to_split[fkey] += split_froms
+            else:
+                sum_.adj_to_split[fkey] = split_froms
+        return sum_
+
+
 class SpaceFrameMesh(Mesh, SpaceFrameMixin):
     FROM_SUBD_TRI = 0
     FROM_SUBD_FRAME = 1
@@ -47,8 +111,11 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
     def nv_coordinates(self, key, *args, **kwargs):
         return self.vertex_coordinates(key, *args, **kwargs)
 
-    def nv_attribute(self, u, v, key, *args, **kwargs):
-        return self.vertex_attribute(u, v, key, *args, **kwargs)
+    def nv_attribute(self, key, name=None, value=None):
+        return self.vertex_attribute(key, name, value)
+
+    def nv_attributes(self, key, **kwattr):
+        return self.vertex_attributes(key, kwattr.keys(), kwattr.items())
 
     def update_default_nv_attributes(self, **kwattr):
         return self.update_default_vertex_attributes(**kwattr)
@@ -58,6 +125,16 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
             super(SpaceFrameMesh, self).delete_face(fkey)
         except KeyError:
             pass
+
+    def nm_attributes(self, **kwattr):
+        for key in self.nvs():
+            self.nv_attributes(key, **kwattr)
+
+        for key in self.faces():
+            self.face_attributes(key, kwattr.keys(), kwattr.items())
+
+        for u, v in self.edges():
+            self.edge_attributes((u, v), kwattr.keys(), kwattr.items())
 
     def weld(self, precision=None):
         """Adapted from compas.datastructures.mesh.join"""
@@ -89,13 +166,32 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
             for face, fdata in faces
         ]
 
-        original_vertices = list(self.vertices())
-        for vkey in original_vertices:
-            self.delete_vertex(vkey)
-        self.cull_vertices()
+        edge_data = {}
+        for u, v in self.edges():
 
-        for fkey in self.faces():
-            print("{} still exists".format(fkey))
+            _tmp_dict = {}
+            for name in self.edge_attributes((u, v)):
+                if name not in self.default_edge_attributes:
+                    value = self.edge_attribute((u, v), name)
+                    _tmp_dict[name] = value
+
+            if len(_tmp_dict) < 1:
+                continue
+
+            u_xyz = key_xyz(u)
+            u_gkey = geometric_key(u_xyz, precision=precision)
+
+            new_u = gkey_key[u_gkey]
+
+            v_xyz = key_xyz(v)
+            v_gkey = geometric_key(v_xyz, precision=precision)
+
+            new_v = gkey_key[v_gkey]
+
+            if len(_tmp_dict) > 0:
+                edge_data[(new_u, new_v)] = _tmp_dict
+
+        self.clear()
 
         for xyz, data in vertices:
             data["x"], data["y"], data["z"] = xyz
@@ -107,6 +203,8 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
                 fdata[name] = data.get(name)
             self.add_face(vkeys, **fdata)
 
+        for key, data in edge_data.iteritems():
+            self.edge_attributes(key, names=data.keys(), values=data.items())
         self.cull_vertices()
         self.unify_cycles()
 
@@ -770,3 +868,28 @@ class SpaceFrameMesh(Mesh, SpaceFrameMixin):
         rg_mesh.Transform(T)
 
         return rg_mesh
+
+    @classmethod
+    def mesh_join(cls, meshes):
+        new_mesh = cls()
+
+        idx_offset = 0
+        for mesh in meshes:
+            for i, vkey in enumerate(mesh.vertices()):
+                data = mesh.vertex_attributes(vkey)
+                new_mesh.add_vertex(key=i + idx_offset, **data)
+
+            for fkey in mesh.faces():
+                face_vertices = [key + idx_offset for key in mesh.face_vertices(fkey)]
+                data = mesh.face_attributes(fkey)
+                new_mesh.add_face(face_vertices, **data)
+
+            for u, v in mesh.edges():
+                data = mesh.edge_attributes((u, v))
+                new_mesh.edge_attributes(
+                    (u + idx_offset, v + idx_offset), data.keys(), data.items()
+                )
+
+            idx_offset += i
+
+        return new_mesh

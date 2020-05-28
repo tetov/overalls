@@ -46,10 +46,11 @@ def meshes_to_network(meshes):
 
 
 def is_in_domain(value, domain):
-    min, max = domain
+    print("val: {}, domain: {}".format(value, domain))
+    min_, max_ = domain
 
-    min_ok = value > min or min is None
-    max_ok = value < max or max is None
+    min_ok = value > min_ or min_ is None
+    max_ok = value < max_ or max_ is None
 
     return min_ok and max_ok
 
